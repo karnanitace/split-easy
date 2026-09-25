@@ -1,0 +1,41 @@
+# Byte-compiled / cached files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build and distribution artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+
+# Test, lint and coverage caches
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local databases
+*.db
+*.sqlite3
+
+# Generated output
+exports/
+charts/
+
+# IDE and editor folders
+.vscode/
+.idea/
+*.swp
+.DS_Store
