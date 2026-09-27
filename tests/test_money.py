@@ -2,9 +2,10 @@ from decimal import Decimal
 
 import pytest
 
-from spliteasy.exceptions import CurrencyError, InvalidAmountError
+from spliteasy.exceptions import AllocationError, CurrencyError, InvalidAmountError
 from spliteasy.money import (
     CURRENCY_DECIMALS,
+    distribute_remainder,
     minor_unit,
     normalize_currency,
     to_money,
@@ -174,3 +175,153 @@ def test_to_money_rejects_both_separators_with_helpful_message() -> None:
 def test_to_money_rejects_malformed_currency() -> None:
     with pytest.raises(CurrencyError):
         to_money("1.00", "EURO")
+
+
+def test_distribute_remainder_three_way_split() -> None:
+    third = Decimal("100.00") / 3
+
+    result = distribute_remainder(
+        {"Ana": third, "Ben": third, "Chen": third}, Decimal("100.00")
+    )
+
+    assert result == {
+        "Ana": Decimal("33.34"),
+        "Ben": Decimal("33.33"),
+        "Chen": Decimal("33.33"),
+    }
+    assert sum(result.values()) == Decimal("100.00")
+
+
+def test_distribute_remainder_favours_largest_remainders() -> None:
+    raw = {
+        "a": Decimal("1.001"),
+        "b": Decimal("1.009"),
+        "c": Decimal("1.005"),
+        "d": Decimal("0.985"),
+    }
+
+    result = distribute_remainder(raw, Decimal("4.00"))
+
+    assert result == {
+        "a": Decimal("1.00"),
+        "b": Decimal("1.01"),
+        "c": Decimal("1.01"),
+        "d": Decimal("0.98"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("keys", "expected"),
+    [
+        (["x", "y", "z"], ["3.34", "3.33", "3.33"]),
+        (["z", "y", "x"], ["3.34", "3.33", "3.33"]),
+        ([3, 1, 2], ["3.34", "3.33", "3.33"]),
+    ],
+)
+def test_distribute_remainder_breaks_ties_by_key_order(
+    keys: list[object], expected: list[str]
+) -> None:
+    third = Decimal("10.00") / 3
+
+    result = distribute_remainder(dict.fromkeys(keys, third), Decimal("10.00"))
+
+    assert list(result) == keys
+    assert list(result.values()) == [Decimal(v) for v in expected]
+
+
+def test_distribute_remainder_ties_after_larger_remainder() -> None:
+    raw = {
+        "a": Decimal("0.334"),
+        "b": Decimal("0.338"),
+        "c": Decimal("0.334"),
+        "d": Decimal("0.994"),
+    }
+
+    result = distribute_remainder(raw, Decimal("2.00"))
+
+    assert result == {
+        "a": Decimal("0.34"),
+        "b": Decimal("0.34"),
+        "c": Decimal("0.33"),
+        "d": Decimal("0.99"),
+    }
+
+
+def test_distribute_remainder_jpy_uses_whole_units() -> None:
+    third = Decimal("1000") / 3
+
+    result = distribute_remainder(
+        {1: third, 2: third, 3: third}, Decimal("1000"), "JPY"
+    )
+
+    assert result == {1: Decimal("334"), 2: Decimal("333"), 3: Decimal("333")}
+    assert all(value.as_tuple().exponent == 0 for value in result.values())
+
+
+def test_distribute_remainder_without_leftover() -> None:
+    raw = {"a": Decimal("12.50"), "b": Decimal("7.25"), "c": Decimal("0.25")}
+
+    result = distribute_remainder(raw, Decimal("20.00"))
+
+    assert result == raw
+    assert all(value.as_tuple().exponent == -2 for value in result.values())
+
+
+def test_distribute_remainder_handles_negative_amounts() -> None:
+    third = Decimal("-100.00") / 3
+
+    result = distribute_remainder(
+        {"a": third, "b": third, "c": third}, Decimal("-100.00")
+    )
+
+    assert result == {
+        "a": Decimal("-33.33"),
+        "b": Decimal("-33.33"),
+        "c": Decimal("-33.34"),
+    }
+
+
+def test_distribute_remainder_returns_new_dict() -> None:
+    raw = {"a": Decimal("5.00"), "b": Decimal("5.00")}
+
+    result = distribute_remainder(raw, Decimal("10.00"))
+
+    assert result is not raw
+
+
+@pytest.mark.parametrize(
+    "total", [Decimal("10.001"), Decimal("10.005"), Decimal("NaN"), Decimal("Infinity")]
+)
+def test_distribute_remainder_rejects_unquantized_total(total: Decimal) -> None:
+    with pytest.raises(AllocationError, match="quantised"):
+        distribute_remainder({"a": Decimal("5"), "b": Decimal("5")}, total)
+
+
+def test_distribute_remainder_rejects_fractional_total_for_jpy() -> None:
+    with pytest.raises(AllocationError):
+        distribute_remainder({"a": Decimal("5.5")}, Decimal("5.5"), "JPY")
+
+
+@pytest.mark.parametrize(
+    ("raw", "total"),
+    [
+        ({"a": Decimal("5.00"), "b": Decimal("5.00")}, Decimal("10.03")),
+        ({"a": Decimal("5.00"), "b": Decimal("5.00")}, Decimal("9.99")),
+        ({"a": Decimal("50"), "b": Decimal("50")}, Decimal("10.00")),
+    ],
+)
+def test_distribute_remainder_rejects_raw_not_matching_total(
+    raw: dict[str, Decimal], total: Decimal
+) -> None:
+    with pytest.raises(AllocationError, match="differs from the total"):
+        distribute_remainder(raw, total)
+
+
+def test_distribute_remainder_rejects_non_finite_raw_amount() -> None:
+    with pytest.raises(AllocationError, match="finite"):
+        distribute_remainder({"a": Decimal("NaN")}, Decimal("1.00"))
+
+
+def test_distribute_remainder_rejects_empty_input() -> None:
+    with pytest.raises(AllocationError, match="no keys"):
+        distribute_remainder({}, Decimal("10.00"))
