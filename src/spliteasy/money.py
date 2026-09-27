@@ -40,6 +40,16 @@ CURRENCY_DECIMALS: dict[str, int] = {
 _DEFAULT_DECIMALS = 2
 _CURRENCY_CODE = re.compile(r"[A-Z]{3}")
 
+# Display symbol for each currency, and whether it goes before the number.
+_CURRENCY_SYMBOLS: dict[str, tuple[str, bool]] = {
+    "EUR": ("€", False),
+    "USD": ("$", True),
+    "GBP": ("£", True),
+    "JPY": ("¥", True),
+    "CHF": ("CHF", False),
+    "INR": ("₹", True),
+}
+
 
 def normalize_currency(code: str) -> str:
     """Normalises and validates an ISO 4217 currency code."""
@@ -237,6 +247,53 @@ def split_equally(
         duplicates = sorted({repr(key) for key in keys if keys.count(key) > 1})
         raise AllocationError(f"Duplicate keys: {', '.join(duplicates)}")
     return allocate(total, weights, currency)
+
+
+def format_money(amount: Decimal, currency: str = "EUR", *, symbol: bool = True) -> str:
+    """Formats an amount for display.
+
+    The amount is first quantised to the currency's minor unit with
+    :func:`to_money`. It is then written with a comma as the thousands
+    separator and as many decimals as the currency uses.
+
+    With ``symbol=True``, known currencies use their symbol: ``$``, ``£``,
+    ``¥`` and ``₹`` go before the number (``"$1,234.50"``), while ``€`` and
+    ``CHF`` go after it with a space (``"1,234.50 €"``). Other currencies fall
+    back to their code after the number (``"12.00 SEK"``). With
+    ``symbol=False``, the code always goes after the number
+    (``"1,234.50 EUR"``). A minus sign always comes first (``"-$12.50"``,
+    ``"-12.50 €"``).
+
+    Args:
+        amount: The amount to format.
+        currency: The ISO 4217 code of the amount.
+        symbol: Whether to use the currency symbol instead of the code.
+
+    Returns:
+        The formatted amount.
+
+    Raises:
+        InvalidAmountError: If the amount is not a finite number.
+        CurrencyError: If the currency code is malformed.
+
+    Examples:
+        >>> format_money(Decimal("-1234.5"), "USD")
+        '-$1,234.50'
+        >>> format_money(Decimal("1234.5"), symbol=False)
+        '1,234.50 EUR'
+    """
+    code = normalize_currency(currency)
+    value = to_money(amount, code)
+    decimals = -minor_unit(code).as_tuple().exponent
+    sign = "-" if value < 0 else ""
+    number = f"{abs(value):,.{decimals}f}"
+
+    display, before = _CURRENCY_SYMBOLS.get(code, (code, False))
+    if not symbol:
+        display, before = code, False
+    if before:
+        return f"{sign}{display}{number}"
+    return f"{sign}{number} {display}"
 
 
 def _to_weight(key: object, weight: object) -> Decimal:

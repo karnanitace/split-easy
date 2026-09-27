@@ -7,6 +7,7 @@ from spliteasy.money import (
     CURRENCY_DECIMALS,
     allocate,
     distribute_remainder,
+    format_money,
     minor_unit,
     normalize_currency,
     split_equally,
@@ -467,3 +468,82 @@ def test_split_equally_rejects_empty_keys() -> None:
 def test_split_equally_rejects_duplicate_keys() -> None:
     with pytest.raises(AllocationError, match="Duplicate keys: 'Ana'"):
         split_equally("10.00", ["Ana", "Ben", "Ana"])
+
+
+@pytest.mark.parametrize(
+    ("amount", "currency", "expected"),
+    [
+        ("1234.5", "EUR", "1,234.50 €"),
+        ("12", "CHF", "12.00 CHF"),
+        ("1234.5", "USD", "$1,234.50"),
+        ("0.5", "GBP", "£0.50"),
+        ("1234567", "JPY", "¥1,234,567"),
+        ("99.99", "INR", "₹99.99"),
+        ("12", "SEK", "12.00 SEK"),
+        ("12", "XYZ", "12.00 XYZ"),
+        ("1000000.00", "EUR", "1,000,000.00 €"),
+        ("0", "EUR", "0.00 €"),
+        ("12", " usd ", "$12.00"),
+    ],
+)
+def test_format_money_with_symbol(amount: str, currency: str, expected: str) -> None:
+    assert format_money(Decimal(amount), currency) == expected
+
+
+@pytest.mark.parametrize(
+    ("amount", "currency", "expected"),
+    [
+        ("1234.5", "EUR", "1,234.50 EUR"),
+        ("1234.5", "USD", "1,234.50 USD"),
+        ("1500", "JPY", "1,500 JPY"),
+        ("12", "SEK", "12.00 SEK"),
+        ("-12.5", "GBP", "-12.50 GBP"),
+    ],
+)
+def test_format_money_without_symbol(amount: str, currency: str, expected: str) -> None:
+    assert format_money(Decimal(amount), currency, symbol=False) == expected
+
+
+@pytest.mark.parametrize(
+    ("amount", "currency", "expected"),
+    [
+        ("-12.5", "EUR", "-12.50 €"),
+        ("-12.5", "USD", "-$12.50"),
+        ("-1234.5", "CHF", "-1,234.50 CHF"),
+        ("-1500", "JPY", "-¥1,500"),
+        ("-12", "SEK", "-12.00 SEK"),
+    ],
+)
+def test_format_money_negative_amounts(
+    amount: str, currency: str, expected: str
+) -> None:
+    assert format_money(Decimal(amount), currency) == expected
+
+
+@pytest.mark.parametrize(
+    ("amount", "currency", "expected"),
+    [
+        ("2.345", "EUR", "2.35 €"),
+        ("1234.567", "USD", "$1,234.57"),
+        ("1500.5", "JPY", "¥1,501"),
+        ("-0.001", "EUR", "0.00 €"),
+    ],
+)
+def test_format_money_quantizes_before_formatting(
+    amount: str, currency: str, expected: str
+) -> None:
+    assert format_money(Decimal(amount), currency) == expected
+
+
+def test_format_money_defaults_to_eur() -> None:
+    assert format_money(Decimal("5")) == "5.00 €"
+
+
+def test_format_money_rejects_non_finite_amount() -> None:
+    with pytest.raises(InvalidAmountError):
+        format_money(Decimal("NaN"))
+
+
+def test_format_money_rejects_malformed_currency() -> None:
+    with pytest.raises(CurrencyError):
+        format_money(Decimal("1"), "EURO")
