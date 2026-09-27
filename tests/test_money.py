@@ -5,9 +5,11 @@ import pytest
 from spliteasy.exceptions import AllocationError, CurrencyError, InvalidAmountError
 from spliteasy.money import (
     CURRENCY_DECIMALS,
+    allocate,
     distribute_remainder,
     minor_unit,
     normalize_currency,
+    split_equally,
     to_money,
 )
 
@@ -325,3 +327,143 @@ def test_distribute_remainder_rejects_non_finite_raw_amount() -> None:
 def test_distribute_remainder_rejects_empty_input() -> None:
     with pytest.raises(AllocationError, match="no keys"):
         distribute_remainder({}, Decimal("10.00"))
+
+
+def _decimals(*values: str) -> list[Decimal]:
+    return [Decimal(value) for value in values]
+
+
+def test_allocate_100_eur_equally_among_three() -> None:
+    result = allocate(Decimal("100"), {"Ana": 1, "Ben": 1, "Chen": 1})
+
+    assert list(result.values()) == _decimals("33.34", "33.33", "33.33")
+    assert sum(result.values()) == Decimal("100.00")
+
+
+def test_allocate_by_weights_one_to_two() -> None:
+    result = allocate("10.00", {"Ana": 1, "Ben": 2})
+
+    assert result == {"Ana": Decimal("3.33"), "Ben": Decimal("6.67")}
+
+
+def test_allocate_percentages_as_weights() -> None:
+    result = allocate("99.99", {"Ana": Decimal("60"), "Ben": Decimal("40")})
+
+    assert result == {"Ana": Decimal("59.99"), "Ben": Decimal("40.00")}
+
+
+def test_allocate_zero_weight_yields_zero() -> None:
+    result = allocate("10.00", {"Ana": 1, "Ben": 0, "Chen": 1})
+
+    assert result == {
+        "Ana": Decimal("5.00"),
+        "Ben": Decimal("0.00"),
+        "Chen": Decimal("5.00"),
+    }
+
+
+def test_allocate_negative_total_mirrors_positive_split() -> None:
+    result = allocate("-10", {"Ana": 1, "Ben": 1, "Chen": 1})
+
+    assert list(result.values()) == _decimals("-3.34", "-3.33", "-3.33")
+    assert sum(result.values()) == Decimal("-10.00")
+
+
+def test_allocate_negative_total_keeps_zero_shares_positive() -> None:
+    result = allocate("-10.00", {"Ana": 1, "Ben": 0})
+
+    assert result == {"Ana": Decimal("-10.00"), "Ben": Decimal("0.00")}
+    assert not result["Ben"].is_signed()
+
+
+def test_allocate_jpy_uses_whole_units() -> None:
+    result = allocate(1000, {"Ana": 1, "Ben": 1, "Chen": 1}, "JPY")
+
+    assert list(result.values()) == _decimals("334", "333", "333")
+    assert all(value.as_tuple().exponent == 0 for value in result.values())
+
+
+def test_allocate_accepts_string_inputs() -> None:
+    result = allocate(" 12,50 ", {"Ana": "1.5", "Ben": "0,5", "Chen": " 3 "})
+
+    assert result == {
+        "Ana": Decimal("3.75"),
+        "Ben": Decimal("1.25"),
+        "Chen": Decimal("7.50"),
+    }
+
+
+def test_allocate_quantizes_total_before_splitting() -> None:
+    result = allocate("10.005", {"Ana": 1, "Ben": 1})
+
+    assert sum(result.values()) == Decimal("10.01")
+
+
+def test_allocate_zero_total() -> None:
+    result = allocate(0, {"Ana": 1, "Ben": 2})
+
+    assert result == {"Ana": Decimal("0.00"), "Ben": Decimal("0.00")}
+
+
+def test_allocate_preserves_key_order_and_types() -> None:
+    result = allocate("9.00", {3: 1, 1: 1, 2: 1})
+
+    assert list(result) == [3, 1, 2]
+
+
+@pytest.mark.parametrize(
+    ("weights", "message"),
+    [
+        ({}, "no weights"),
+        ({"Ana": 1, "Ben": -1}, "negative"),
+        ({"Ana": "-0.5"}, "negative"),
+        ({"Ana": 0, "Ben": Decimal("0")}, "all weights are zero"),
+        ({"Ana": "abc"}, "Invalid weight"),
+        ({"Ana": True}, "Invalid weight"),
+        ({"Ana": None}, "Invalid weight"),
+        ({"Ana": Decimal("NaN")}, "finite"),
+        ({"Ana": "Infinity"}, "finite"),
+    ],
+)
+def test_allocate_rejects_invalid_weights(
+    weights: dict[str, object], message: str
+) -> None:
+    with pytest.raises(AllocationError, match=message):
+        allocate("10.00", weights)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("total", ["abc", "NaN", True, None])
+def test_allocate_rejects_invalid_total(total: object) -> None:
+    with pytest.raises(InvalidAmountError):
+        allocate(total, {"Ana": 1})  # type: ignore[arg-type]
+
+
+def test_allocate_rejects_malformed_currency() -> None:
+    with pytest.raises(CurrencyError):
+        allocate("10.00", {"Ana": 1}, "EURO")
+
+
+def test_split_equally_among_three() -> None:
+    result = split_equally("100.00", ["Ana", "Ben", "Chen"])
+
+    assert result == {
+        "Ana": Decimal("33.34"),
+        "Ben": Decimal("33.33"),
+        "Chen": Decimal("33.33"),
+    }
+
+
+def test_split_equally_negative_total_and_jpy() -> None:
+    result = split_equally(-1000, (1, 2, 3), "JPY")
+
+    assert list(result.values()) == _decimals("-334", "-333", "-333")
+
+
+def test_split_equally_rejects_empty_keys() -> None:
+    with pytest.raises(AllocationError, match="no keys"):
+        split_equally("10.00", [])
+
+
+def test_split_equally_rejects_duplicate_keys() -> None:
+    with pytest.raises(AllocationError, match="Duplicate keys: 'Ana'"):
+        split_equally("10.00", ["Ana", "Ben", "Ana"])
