@@ -7,7 +7,8 @@ exactly: ``0.1 + 0.2`` is ``0.30000000000000004`` as a float, and such errors
 make cents appear or disappear when amounts are added up or split. ``Decimal``
 stores ``0.1`` exactly and lets SplitEasy choose how and when to round.
 
-All conversions from user input to money go through :func:`to_money`.
+All user input is parsed with :func:`parse_decimal`. Amounts of money are then
+created with :func:`to_money`, which also rounds them to the minor unit.
 """
 
 import re
@@ -70,12 +71,59 @@ def minor_unit(currency: str = "EUR") -> Decimal:
     return Decimal(1).scaleb(-decimals)
 
 
+def parse_decimal(value: Decimal | int | str | float) -> Decimal:
+    """Parses a value into a finite ``Decimal`` without rounding it.
+
+    Accepted inputs:
+
+    * ``Decimal`` and ``int`` values are used as they are.
+    * ``str`` values are stripped of surrounding whitespace. Either a decimal
+      point (``"12.50"``) or a decimal comma (``"12,50"``) is accepted, but not
+      both in the same string, because ``"1.234,50"`` and ``"1,234.50"`` would
+      be ambiguous.
+    * ``float`` values are converted through ``str(value)``, so ``0.1`` becomes
+      ``Decimal("0.1")`` rather than the exact binary approximation
+      ``Decimal("0.1000000000000000055511151231257827...")``.
+
+    Args:
+        value: The value to parse.
+
+    Returns:
+        The value as a finite ``Decimal`` with all of its digits.
+
+    Raises:
+        InvalidAmountError: If the value is a ``bool`` or an unsupported type,
+            a string that is empty, is not a number or contains both ``","``
+            and ``"."``, or NaN or infinite.
+
+    Examples:
+        >>> parse_decimal("0,3333")
+        Decimal('0.3333')
+    """
+    # bool is a subclass of int, so it must be rejected before the int check.
+    if isinstance(value, bool):
+        raise InvalidAmountError(f"Amount must not be a boolean, got {value!r}")
+    if isinstance(value, Decimal):
+        number = value
+    elif isinstance(value, int):
+        number = Decimal(value)
+    elif isinstance(value, float):
+        number = Decimal(str(value))
+    elif isinstance(value, str):
+        number = _parse_decimal_string(value)
+    else:
+        raise InvalidAmountError(
+            f"Amount must be a Decimal, int, str or float, got {type(value).__name__}"
+        )
+    if not number.is_finite():
+        raise InvalidAmountError(f"Amount must be a finite number, got {value!r}")
+    return number
+
+
 def to_money(value: Decimal | int | str | float, currency: str = "EUR") -> Decimal:
     """Converts a value to a money amount in the given currency."""
     unit = minor_unit(currency)
-    amount = _to_decimal(value)
-    if not amount.is_finite():
-        raise InvalidAmountError(f"Amount must be a finite number, got {value!r}")
+    amount = parse_decimal(value)
     try:
         quantized = amount.quantize(unit, rounding=ROUND_HALF_UP)
     except InvalidOperation as err:
@@ -296,7 +344,7 @@ def format_money(amount: Decimal, currency: str = "EUR", *, symbol: bool = True)
     return f"{sign}{number} {display}"
 
 
-def _to_weight(key: object, weight: object) -> Decimal:
+def _to_weight(key: object, weight: Decimal | int | str) -> Decimal:
     """Converts one allocation weight to a finite, non-negative ``Decimal``.
 
     Args:
@@ -307,15 +355,13 @@ def _to_weight(key: object, weight: object) -> Decimal:
         The weight as an unrounded ``Decimal``.
 
     Raises:
-        AllocationError: If the weight cannot be converted, is not finite or
-            is negative.
+        AllocationError: If the weight cannot be parsed with
+            :func:`parse_decimal` (including NaN and infinity) or is negative.
     """
     try:
-        value = _to_decimal(weight)
+        value = parse_decimal(weight)
     except InvalidAmountError as err:
         raise AllocationError(f"Invalid weight for {key!r}: {err}") from err
-    if not value.is_finite():
-        raise AllocationError(f"Weight for {key!r} must be finite, got {weight!r}")
     if value < 0:
         raise AllocationError(
             f"Weight for {key!r} must not be negative, got {weight!r}"
@@ -323,25 +369,7 @@ def _to_weight(key: object, weight: object) -> Decimal:
     return value
 
 
-def _to_decimal(value: object) -> Decimal:
-    """Converts a supported input value to an unrounded ``Decimal``."""
-    # bool is a subclass of int, so it must be rejected before the int check.
-    if isinstance(value, bool):
-        raise InvalidAmountError(f"Amount must not be a boolean, got {value!r}")
-    if isinstance(value, Decimal):
-        return value
-    if isinstance(value, int):
-        return Decimal(value)
-    if isinstance(value, float):
-        return Decimal(str(value))
-    if isinstance(value, str):
-        return _parse_amount_string(value)
-    raise InvalidAmountError(
-        f"Amount must be a Decimal, int, str or float, got {type(value).__name__}"
-    )
-
-
-def _parse_amount_string(text: str) -> Decimal:
+def _parse_decimal_string(text: str) -> Decimal:
     """Parses a string with a decimal point or a decimal comma."""
     stripped = text.strip()
     if not stripped:

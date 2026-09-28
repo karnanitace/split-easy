@@ -10,6 +10,7 @@ from spliteasy.money import (
     format_money,
     minor_unit,
     normalize_currency,
+    parse_decimal,
     split_equally,
     to_money,
 )
@@ -547,3 +548,66 @@ def test_format_money_rejects_non_finite_amount() -> None:
 def test_format_money_rejects_malformed_currency() -> None:
     with pytest.raises(CurrencyError):
         format_money(Decimal("1"), "EURO")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("0.3333", "0.3333"),
+        ("2.345", "2.345"),
+        ("  12.5  ", "12.5"),
+        ("-7", "-7"),
+        ("1e-10", "1E-10"),
+        (12, "12"),
+        (Decimal("1.23456789"), "1.23456789"),
+        (0.1, "0.1"),
+        (1 / 3, "0.3333333333333333"),
+    ],
+)
+def test_parse_decimal_keeps_all_digits(
+    value: Decimal | int | str | float, expected: str
+) -> None:
+    result = parse_decimal(value)
+
+    assert result == Decimal(expected)
+    assert str(result) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("0,3333", "0.3333"), (" 12,5 ", "12.5"), ("-1,999", "-1.999")],
+)
+def test_parse_decimal_accepts_decimal_comma(value: str, expected: str) -> None:
+    assert str(parse_decimal(value)) == expected
+
+
+def test_parse_decimal_returns_decimal_input_unchanged() -> None:
+    value = Decimal("3.14159")
+
+    assert parse_decimal(value) is value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,
+        False,
+        "",
+        "   ",
+        "abc",
+        "1.234,50",
+        "1,2,3",
+        "NaN",
+        "-Infinity",
+        float("nan"),
+        float("inf"),
+        Decimal("NaN"),
+        Decimal("sNaN"),
+        Decimal("-Infinity"),
+        None,
+        b"1",
+    ],
+)
+def test_parse_decimal_rejects_invalid_input(value: object) -> None:
+    with pytest.raises(InvalidAmountError):
+        parse_decimal(value)  # type: ignore[arg-type]
