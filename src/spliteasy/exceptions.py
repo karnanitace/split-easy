@@ -29,6 +29,10 @@ class SplitError(SplitEasyError, ValueError):
     """Raised when an expense split is invalid."""
 
 
+class ValidationError(SplitEasyError, ValueError):
+    """Raised when model data is invalid, such as an empty name."""
+
+
 class NotFoundError(SplitEasyError, LookupError):
     """Base class for errors raised when a requested entity does not exist.
 

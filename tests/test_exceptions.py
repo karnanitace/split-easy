@@ -14,6 +14,7 @@ from spliteasy.exceptions import (
     SplitEasyError,
     SplitError,
     StorageError,
+    ValidationError,
 )
 
 ALL_EXCEPTIONS = [
@@ -22,6 +23,7 @@ ALL_EXCEPTIONS = [
     AllocationError,
     CurrencyError,
     SplitError,
+    ValidationError,
     NotFoundError,
     GroupNotFoundError,
     MemberNotFoundError,
@@ -45,6 +47,7 @@ def test_every_exception_is_a_spliteasy_error(exc_type: type[Exception]) -> None
         AllocationError,
         CurrencyError,
         SplitError,
+        ValidationError,
         DuplicateError,
     ],
 )
