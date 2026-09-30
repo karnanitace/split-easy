@@ -19,6 +19,7 @@ Example:
     Carol 33.33
 """
 
+from spliteasy.balances import compute_balances, member_summary
 from spliteasy.exceptions import (
     AllocationError,
     CurrencyError,
@@ -41,6 +42,7 @@ from spliteasy.models import (
     DistributionMode,
     Expense,
     Group,
+    Ledger,
     LineItem,
     Member,
     Payment,
@@ -55,9 +57,20 @@ from spliteasy.money import (
     split_equally,
     to_money,
 )
+
+# charts.py imports matplotlib inside its functions only, so this import
+# keeps package start-up fast.
+from spliteasy.reports.charts import (
+    plot_balances,
+    plot_categories,
+    plot_member_spending,
+)
+from spliteasy.services import GroupService
+from spliteasy.settlement import apply_transfers, settle_greedy
 from spliteasy.splitting import (
     EqualSplit,
     ExactSplit,
+    ItemizedSplit,
     PercentageSplit,
     SharesSplit,
     SplitStrategy,
@@ -65,11 +78,15 @@ from spliteasy.splitting import (
     compute_shares,
     get_strategy,
     register_strategy,
+    resolve_items,
 )
+from spliteasy.storage import Repository, SQLiteRepository
 
 __version__ = "0.1.0"
 
 __all__ = [
+    # Application service
+    "GroupService",
     # Models
     "Group",
     "Member",
@@ -79,6 +96,7 @@ __all__ = [
     "Adjustment",
     "Payment",
     "Transfer",
+    "Ledger",
     "SplitMethod",
     "AdjustmentKind",
     "DistributionMode",
@@ -94,10 +112,24 @@ __all__ = [
     "SharesSplit",
     "PercentageSplit",
     "ExactSplit",
+    "ItemizedSplit",
     "get_strategy",
     "register_strategy",
     "compute_shares",
     "apply_split",
+    "resolve_items",
+    # Balances and settlement
+    "compute_balances",
+    "member_summary",
+    "settle_greedy",
+    "apply_transfers",
+    # Storage
+    "Repository",
+    "SQLiteRepository",
+    # Charts
+    "plot_balances",
+    "plot_categories",
+    "plot_member_spending",
     # Exceptions
     "SplitEasyError",
     "ValidationError",
