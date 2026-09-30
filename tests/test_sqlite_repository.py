@@ -6,8 +6,22 @@ from pathlib import Path
 import pytest
 
 from spliteasy.exceptions import GroupNotFoundError, StorageError
-from spliteasy.models import Group, Ledger, Member, Payment
+from spliteasy.models import (
+    Adjustment,
+    AdjustmentKind,
+    DistributionMode,
+    Expense,
+    Group,
+    Ledger,
+    LineItem,
+    Member,
+    Payment,
+    Share,
+    SplitMethod,
+)
+from spliteasy.splitting import apply_split
 from spliteasy.storage import Repository, SQLiteRepository
+from spliteasy.storage.schema import TABLES
 from spliteasy.storage.sqlite import DB_ENV_VAR, default_db_path
 
 
@@ -344,3 +358,301 @@ def test_newer_schema_raises_storage_error_and_closes(db_path: Path) -> None:
         SQLiteRepository(db_path)
 
     db_path.unlink()
+
+
+# Expenses
+
+
+def split(expense: Expense, ledger: Ledger) -> Expense:
+    return apply_split(expense, ledger.group)
+
+
+def round_trip(repo: SQLiteRepository, ledger: Ledger) -> Ledger:
+    repo.save(ledger)
+    return repo.load(ledger.group.name)
+
+
+def test_round_trip_equal_expense(repo: SQLiteRepository) -> None:
+    ledger = make_ledger()
+    ledger.expenses.append(
+        split(
+            Expense(
+                description="Pizza",
+                amount="25.00",
+                payer="Alice",
+                participants=["Alice", "Bob"],
+                category="food",
+                date=date(2026, 9, 3),
+                note="Friday night",
+            ),
+            ledger,
+        )
+    )
+
+    loaded = round_trip(repo, ledger)
+
+    assert loaded.expenses == ledger.expenses
+    assert loaded.expenses[0].participants == ["Alice", "Bob"]
+    assert loaded.expenses[0].shares == [
+        Share("Alice", Decimal("12.50")),
+        Share("Bob", Decimal("12.50")),
+    ]
+
+
+def test_round_trip_equal_expense_among_all_members(repo: SQLiteRepository) -> None:
+    ledger = make_ledger()
+    ledger.expenses.append(
+        split(Expense(description="Taxi", amount="100.00", payer="Carol"), ledger)
+    )
+
+    loaded = round_trip(repo, ledger)
+
+    assert loaded.expenses == ledger.expenses
+    assert loaded.expenses[0].participants == []
+
+
+@pytest.mark.parametrize(
+    ("method", "values"),
+    [
+        (SplitMethod.EXACT, {"Alice": "40.00", "Bob": "30.00", "Carol": "50.00"}),
+        (SplitMethod.PERCENTAGE, {"Carol": "12.5", "Alice": "50", "Bob": "37.5"}),
+        (SplitMethod.SHARES, {"Bob": "1.5", "Alice": "2", "Carol": "0"}),
+    ],
+)
+def test_round_trip_expense_with_split_values(
+    repo: SQLiteRepository, method: SplitMethod, values: dict[str, str]
+) -> None:
+    ledger = make_ledger()
+    ledger.expenses.append(
+        split(
+            Expense(
+                description="Dinner",
+                amount="120.00",
+                payer="Bob",
+                split_method=method,
+                split_values={member: Decimal(v) for member, v in values.items()},
+            ),
+            ledger,
+        )
+    )
+
+    loaded = round_trip(repo, ledger)
+
+    assert loaded.expenses == ledger.expenses
+    expense = loaded.expenses[0]
+    assert expense.split_method is method
+    assert list(expense.split_values) == list(values)
+    assert [str(v) for v in expense.split_values.values()] == list(values.values())
+
+
+def test_round_trip_foreign_currency_expense(repo: SQLiteRepository) -> None:
+    ledger = make_ledger()
+    ledger.expenses.append(
+        split(
+            Expense(
+                description="Fondue",
+                amount="96.00",
+                payer="Carol",
+                currency="CHF",
+                rate_to_base="1.061234",
+                split_method="shares",
+                split_values={"Alice": 1, "Bob": 1, "Carol": 2},
+            ),
+            ledger,
+        )
+    )
+
+    loaded = round_trip(repo, ledger)
+
+    assert loaded.expenses == ledger.expenses
+    expense = loaded.expenses[0]
+    assert expense.currency == "CHF"
+    assert str(expense.rate_to_base) == "1.061234"
+    assert sum(share.amount for share in expense.shares) == expense.base_amount("EUR")
+
+
+def kaufland_expense() -> Expense:
+    return Expense(
+        description="Kaufland",
+        amount="13.50",
+        payer="Alice",
+        split_method=SplitMethod.ITEMIZED,
+        category="groceries",
+        items=[
+            LineItem.for_members("Olive oil", "6.00", ["Alice", "Bob"]),
+            LineItem.for_members("Protein bars", "2.50", ["Alice"], quantity=2),
+            LineItem(
+                name="Coffee",
+                price=Decimal("5.00"),
+                assignees={"Bob": Decimal(70), "Alice": Decimal(30)},
+                split_method=SplitMethod.PERCENTAGE,
+                category="Drinks",
+            ),
+            LineItem.for_members(
+                "Bottle deposit return",
+                "-0.25",
+                ["Bob"],
+                quantity=4,
+                category="deposit",
+            ),
+        ],
+        adjustments=[
+            Adjustment(
+                kind=AdjustmentKind.DISCOUNT,
+                amount=Decimal("2.00"),
+                description="Loyalty coupon",
+            ),
+            Adjustment(
+                kind=AdjustmentKind.FEE,
+                amount=Decimal("0.50"),
+                distribute=DistributionMode.EQUAL,
+            ),
+        ],
+        shares=[Share("Alice", Decimal("7.40")), Share("Bob", Decimal("6.10"))],
+    )
+
+
+def test_round_trip_itemized_expense(repo: SQLiteRepository) -> None:
+    ledger = make_ledger()
+    ledger.expenses.append(kaufland_expense())
+
+    loaded = round_trip(repo, ledger)
+
+    assert loaded.expenses == ledger.expenses
+    expense = loaded.expenses[0]
+    assert expense.items_total == Decimal("13.50")
+    assert expense.items_total == expense.amount
+    assert [item.name for item in expense.items] == [
+        "Olive oil",
+        "Protein bars",
+        "Coffee",
+        "Bottle deposit return",
+    ]
+    assert expense.items[2].assignees == {"Bob": Decimal(70), "Alice": Decimal(30)}
+    assert list(expense.items[2].assignees) == ["Bob", "Alice"]
+    assert expense.items[2].split_method is SplitMethod.PERCENTAGE
+    assert expense.items[3].price == Decimal("-0.25")
+    assert expense.items[3].total == Decimal("-1.00")
+    assert expense.adjustments[0].signed_amount == Decimal("-2.00")
+    assert expense.adjustments[1].distribute is DistributionMode.EQUAL
+
+
+def test_expenses_are_loaded_sorted_by_id(repo: SQLiteRepository) -> None:
+    ledger = make_ledger()
+    for expense_id, description in [(5, "Later"), (2, "Earlier"), (9, "Latest")]:
+        expense = Expense(
+            description=description, amount="3.00", payer="Alice", id=expense_id
+        )
+        ledger.expenses.append(split(expense, ledger))
+
+    loaded = round_trip(repo, ledger)
+
+    assert [expense.id for expense in loaded.expenses] == [2, 5, 9]
+
+
+def test_save_assigns_expense_ids_and_group_ids(repo: SQLiteRepository) -> None:
+    ledger = make_ledger()
+    ledger.expenses.append(
+        split(Expense(description="A", amount="3.00", payer="Alice", id=4), ledger)
+    )
+    ledger.expenses.append(
+        split(Expense(description="B", amount="3.00", payer="Alice"), ledger)
+    )
+
+    repo.save(ledger)
+
+    assert [expense.id for expense in ledger.expenses] == [4, 5]
+    assert all(expense.group_id == ledger.group.id for expense in ledger.expenses)
+
+
+def full_ledger() -> Ledger:
+    ledger = make_ledger(payments=(bob_pays_alice(),))
+    ledger.expenses.append(kaufland_expense())
+    ledger.expenses.append(
+        split(
+            Expense(
+                description="Dinner",
+                amount="30.00",
+                payer="Bob",
+                participants=["Alice", "Bob"],
+            ),
+            ledger,
+        )
+    )
+    ledger.expenses.append(
+        split(
+            Expense(
+                description="Hotel",
+                amount="90.00",
+                payer="Carol",
+                split_method="shares",
+                split_values={"Alice": 1, "Carol": 2},
+            ),
+            ledger,
+        )
+    )
+    return ledger
+
+
+def row_counts(repo: SQLiteRepository) -> dict[str, int]:
+    return {
+        table: repo._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in TABLES
+        if table != "schema_version"
+    }
+
+
+def test_deleting_a_group_removes_all_child_rows(repo: SQLiteRepository) -> None:
+    repo.save(full_ledger())
+    assert all(count > 0 for count in row_counts(repo).values())
+
+    repo.delete("Italy Trip")
+
+    assert all(count == 0 for count in row_counts(repo).values())
+
+
+def test_deleting_one_group_keeps_other_groups(repo: SQLiteRepository) -> None:
+    other = full_ledger()
+    other.group.name = "Flat"
+    repo.save(full_ledger())
+    repo.save(other)
+
+    repo.delete("Italy Trip")
+
+    assert repo.load("Flat").expenses == other.expenses
+
+
+def test_saving_after_removing_an_expense_removes_its_rows(
+    repo: SQLiteRepository,
+) -> None:
+    ledger = full_ledger()
+    repo.save(ledger)
+    kaufland_id = ledger.expenses[0].id
+
+    ledger.remove_expense(kaufland_id)  # type: ignore[arg-type]
+    repo.save(ledger)
+
+    loaded = repo.load("Italy Trip")
+    assert [expense.description for expense in loaded.expenses] == ["Dinner", "Hotel"]
+    for table in (
+        "expense_shares",
+        "expense_items",
+        "item_assignees",
+        "expense_adjustments",
+    ):
+        count = repo._conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE expense_id = ?", (kaufland_id,)
+        ).fetchone()[0]
+        assert count == 0, table
+    assert row_counts(repo)["expense_items"] == 0
+    assert row_counts(repo)["expense_participants"] == 2
+
+
+def test_full_ledger_round_trip(repo: SQLiteRepository) -> None:
+    ledger = full_ledger()
+
+    loaded = round_trip(repo, ledger)
+
+    assert loaded.group.member_names == ledger.group.member_names
+    assert loaded.expenses == ledger.expenses
+    assert loaded.payments == ledger.payments

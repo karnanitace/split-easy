@@ -13,6 +13,7 @@ ASCII letters.
 
 import os
 import sqlite3
+from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -20,7 +21,19 @@ from decimal import Decimal
 from pathlib import Path
 
 from spliteasy.exceptions import GroupNotFoundError, StorageError
-from spliteasy.models import Expense, Group, Ledger, Member, Payment
+from spliteasy.models import (
+    Adjustment,
+    AdjustmentKind,
+    DistributionMode,
+    Expense,
+    Group,
+    Ledger,
+    LineItem,
+    Member,
+    Payment,
+    Share,
+    SplitMethod,
+)
 from spliteasy.storage.base import Repository
 from spliteasy.storage.schema import initialize_schema
 
@@ -154,11 +167,13 @@ class SQLiteRepository(Repository):
         """Saves a whole group in one transaction, replacing any stored version.
 
         The group is matched by name, ignoring case. An existing group keeps
-        its database id; everything stored for it before is replaced. Payments
-        without an id get the next free id of the group.
+        its database id; everything stored for it before is replaced, so an
+        expense removed from the ledger is removed from the database too.
+        Expenses and payments without an id get the next free id of the group.
 
         This updates the ledger in place: ``ledger.group.id`` is set to the
-        database id, and every payment gets its ``id`` and ``group_id``.
+        database id, and every expense and payment gets its ``id`` and
+        ``group_id``.
 
         Args:
             ledger: The group and all of its data.
@@ -168,6 +183,9 @@ class SQLiteRepository(Repository):
                 in the database in that case.
         """
         group = ledger.group
+        for expense in ledger.expenses:
+            if expense.id is None:
+                expense.id = ledger.next_expense_id()
         for payment in ledger.payments:
             if payment.id is None:
                 payment.id = ledger.next_payment_id()
@@ -215,8 +233,8 @@ class SQLiteRepository(Repository):
             )
 
         group.id = group_id
-        for payment in ledger.payments:
-            payment.group_id = group_id
+        for entity in (*ledger.expenses, *ledger.payments):
+            entity.group_id = group_id
 
     def delete(self, group_name: str) -> None:
         """Deletes a group and, through cascading deletes, all of its data.
@@ -250,26 +268,242 @@ class SQLiteRepository(Repository):
         return None
 
     def _save_expenses(self, group_id: int, expenses: Sequence[Expense]) -> None:
-        """Writes a group's expenses. Placeholder: expenses are not stored yet.
+        """Writes a group's expenses and all of their child rows.
 
         Called by :meth:`save` inside its transaction, after the group's old
-        expense rows have been deleted.
+        expense rows have been deleted. Every expense must already have an id.
 
         Args:
             group_id: The database id of the group.
             expenses: The group's expenses.
         """
+        for expense in expenses:
+            self._conn.execute(
+                "INSERT INTO expenses (group_id, id, description, amount, currency, "
+                "rate_to_base, payer, split_method, category, date, note) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    group_id,
+                    expense.id,
+                    expense.description,
+                    str(expense.amount),
+                    expense.currency,
+                    str(expense.rate_to_base),
+                    expense.payer,
+                    expense.split_method.value,
+                    expense.category,
+                    expense.date.isoformat(),
+                    expense.note,
+                ),
+            )
+            self._write_participants(group_id, expense)
+            self._write_split_values(group_id, expense)
+            self._write_shares(group_id, expense)
+            self._write_items(group_id, expense)
+            self._write_adjustments(group_id, expense)
+
+    def _write_participants(self, group_id: int, expense: Expense) -> None:
+        """Writes an expense's participants in order."""
+        self._conn.executemany(
+            "INSERT INTO expense_participants "
+            "(group_id, expense_id, position, member) VALUES (?, ?, ?, ?)",
+            [
+                (group_id, expense.id, position, member)
+                for position, member in enumerate(expense.participants)
+            ],
+        )
+
+    def _write_split_values(self, group_id: int, expense: Expense) -> None:
+        """Writes an expense's split values in order."""
+        self._conn.executemany(
+            "INSERT INTO expense_split_values "
+            "(group_id, expense_id, position, member, value) VALUES (?, ?, ?, ?, ?)",
+            [
+                (group_id, expense.id, position, member, str(value))
+                for position, (member, value) in enumerate(expense.split_values.items())
+            ],
+        )
+
+    def _write_shares(self, group_id: int, expense: Expense) -> None:
+        """Writes an expense's computed shares in order."""
+        self._conn.executemany(
+            "INSERT INTO expense_shares "
+            "(group_id, expense_id, position, member, amount) VALUES (?, ?, ?, ?, ?)",
+            [
+                (group_id, expense.id, position, share.member, str(share.amount))
+                for position, share in enumerate(expense.shares)
+            ],
+        )
+
+    def _write_items(self, group_id: int, expense: Expense) -> None:
+        """Writes an expense's line items and their assignees in order."""
+        self._conn.executemany(
+            "INSERT INTO expense_items (group_id, expense_id, position, name, price, "
+            "quantity, split_method, category) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    group_id,
+                    expense.id,
+                    position,
+                    item.name,
+                    str(item.price),
+                    item.quantity,
+                    item.split_method.value,
+                    item.category,
+                )
+                for position, item in enumerate(expense.items)
+            ],
+        )
+        self._conn.executemany(
+            "INSERT INTO item_assignees (group_id, expense_id, item_position, "
+            "position, member, weight) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (group_id, expense.id, item_position, position, member, str(weight))
+                for item_position, item in enumerate(expense.items)
+                for position, (member, weight) in enumerate(item.assignees.items())
+            ],
+        )
+
+    def _write_adjustments(self, group_id: int, expense: Expense) -> None:
+        """Writes an expense's receipt adjustments in order."""
+        self._conn.executemany(
+            "INSERT INTO expense_adjustments (group_id, expense_id, position, kind, "
+            "amount, distribute, description) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    group_id,
+                    expense.id,
+                    position,
+                    adjustment.kind.value,
+                    str(adjustment.amount),
+                    adjustment.distribute.value,
+                    adjustment.description,
+                )
+                for position, adjustment in enumerate(expense.adjustments)
+            ],
+        )
 
     def _load_expenses(self, group_id: int) -> list[Expense]:
-        """Reads a group's expenses. Placeholder: always returns no expenses.
+        """Reads a group's expenses with all of their child rows.
+
+        Each child table is read with one query for the whole group and then
+        grouped by expense, instead of one query per expense.
 
         Args:
             group_id: The database id of the group.
 
         Returns:
-            The group's expenses; currently always an empty list.
+            The group's expenses, sorted by id, with every list in its stored
+            order.
         """
-        return []
+        rows = self._conn.execute(
+            "SELECT * FROM expenses WHERE group_id = ? ORDER BY id", (group_id,)
+        ).fetchall()
+        participants = self._read_participants(group_id)
+        split_values = self._read_split_values(group_id)
+        shares = self._read_shares(group_id)
+        items = self._read_items(group_id)
+        adjustments = self._read_adjustments(group_id)
+        return [
+            Expense(
+                description=row["description"],
+                amount=Decimal(row["amount"]),
+                payer=row["payer"],
+                currency=row["currency"],
+                split_method=SplitMethod(row["split_method"]),
+                participants=participants[row["id"]],
+                split_values=split_values[row["id"]],
+                items=items[row["id"]],
+                adjustments=adjustments[row["id"]],
+                category=row["category"],
+                date=date.fromisoformat(row["date"]),
+                rate_to_base=Decimal(row["rate_to_base"]),
+                shares=shares[row["id"]],
+                note=row["note"],
+                id=row["id"],
+                group_id=row["group_id"],
+            )
+            for row in rows
+        ]
+
+    def _child_rows(self, table: str, group_id: int) -> list[sqlite3.Row]:
+        """Returns a group's rows from an expense child table in stored order.
+
+        Args:
+            table: One of the expense child tables. Only called with fixed
+                table names from this module.
+            group_id: The database id of the group.
+
+        Returns:
+            The rows, ordered by expense id and position.
+        """
+        return self._conn.execute(
+            f"SELECT * FROM {table} WHERE group_id = ? ORDER BY expense_id, position",
+            (group_id,),
+        ).fetchall()
+
+    def _read_participants(self, group_id: int) -> defaultdict[int, list[str]]:
+        """Reads the participants of every expense in a group, by expense id."""
+        result: defaultdict[int, list[str]] = defaultdict(list)
+        for row in self._child_rows("expense_participants", group_id):
+            result[row["expense_id"]].append(row["member"])
+        return result
+
+    def _read_split_values(self, group_id: int) -> defaultdict[int, dict[str, Decimal]]:
+        """Reads the split values of every expense in a group, by expense id."""
+        result: defaultdict[int, dict[str, Decimal]] = defaultdict(dict)
+        for row in self._child_rows("expense_split_values", group_id):
+            result[row["expense_id"]][row["member"]] = Decimal(row["value"])
+        return result
+
+    def _read_shares(self, group_id: int) -> defaultdict[int, list[Share]]:
+        """Reads the shares of every expense in a group, by expense id."""
+        result: defaultdict[int, list[Share]] = defaultdict(list)
+        for row in self._child_rows("expense_shares", group_id):
+            result[row["expense_id"]].append(
+                Share(row["member"], Decimal(row["amount"]))
+            )
+        return result
+
+    def _read_items(self, group_id: int) -> defaultdict[int, list[LineItem]]:
+        """Reads the line items of every expense in a group, by expense id."""
+        assignees: defaultdict[tuple[int, int], dict[str, Decimal]] = defaultdict(dict)
+        assignee_rows = self._conn.execute(
+            "SELECT * FROM item_assignees WHERE group_id = ? "
+            "ORDER BY expense_id, item_position, position",
+            (group_id,),
+        )
+        for row in assignee_rows:
+            key = (row["expense_id"], row["item_position"])
+            assignees[key][row["member"]] = Decimal(row["weight"])
+
+        result: defaultdict[int, list[LineItem]] = defaultdict(list)
+        for row in self._child_rows("expense_items", group_id):
+            result[row["expense_id"]].append(
+                LineItem(
+                    name=row["name"],
+                    price=Decimal(row["price"]),
+                    quantity=row["quantity"],
+                    assignees=assignees[(row["expense_id"], row["position"])],
+                    split_method=SplitMethod(row["split_method"]),
+                    category=row["category"],
+                )
+            )
+        return result
+
+    def _read_adjustments(self, group_id: int) -> defaultdict[int, list[Adjustment]]:
+        """Reads the adjustments of every expense in a group, by expense id."""
+        result: defaultdict[int, list[Adjustment]] = defaultdict(list)
+        for row in self._child_rows("expense_adjustments", group_id):
+            result[row["expense_id"]].append(
+                Adjustment(
+                    kind=AdjustmentKind(row["kind"]),
+                    amount=Decimal(row["amount"]),
+                    distribute=DistributionMode(row["distribute"]),
+                    description=row["description"],
+                )
+            )
+        return result
 
 
 @contextmanager
