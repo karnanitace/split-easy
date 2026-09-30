@@ -8,6 +8,7 @@ from spliteasy.exceptions import AllocationError, SplitError
 from spliteasy.models import SplitMethod
 from spliteasy.splitting import (
     EqualSplit,
+    PercentageSplit,
     SharesSplit,
     SplitStrategy,
     get_strategy,
@@ -424,3 +425,99 @@ def test_shares_split_is_registered() -> None:
 
     assert isinstance(strategy, SharesSplit)
     assert strategy.method is SplitMethod.SHARES
+
+
+# PercentageSplit
+
+
+def percentages(**values: str) -> dict[str, Decimal]:
+    return {member: Decimal(value) for member, value in values.items()}
+
+
+def test_percentage_split_60_40() -> None:
+    result = PercentageSplit().split("50.00", percentages(Alice="60", Bob="40"))
+
+    assert result == {"Alice": Decimal("30.00"), "Bob": Decimal("20.00")}
+
+
+def test_percentage_split_thirds_of_100() -> None:
+    values = percentages(Alice="33.33", Bob="33.33", Carol="33.34")
+
+    result = PercentageSplit().split("100.00", values)
+
+    assert result == {
+        "Alice": Decimal("33.33"),
+        "Bob": Decimal("33.33"),
+        "Carol": Decimal("33.34"),
+    }
+
+
+def test_percentage_split_with_decimal_percentages() -> None:
+    result = PercentageSplit().split("80.00", percentages(Alice="12.5", Bob="87.5"))
+
+    assert result == {"Alice": Decimal("10.00"), "Bob": Decimal("70.00")}
+
+
+def test_percentage_raw_split_is_unrounded() -> None:
+    raw = PercentageSplit().raw_split(
+        Decimal("10.00"), percentages(Alice="33.33", Bob="66.67")
+    )
+
+    assert raw == {"Alice": Decimal("3.333"), "Bob": Decimal("6.667")}
+
+
+def test_percentage_split_rounds_with_largest_remainder() -> None:
+    result = PercentageSplit().split("10.00", percentages(Alice="33.33", Bob="66.67"))
+
+    assert result == {"Alice": Decimal("3.33"), "Bob": Decimal("6.67")}
+
+
+def test_percentage_split_zero_percentage() -> None:
+    values = percentages(Alice="100", Bob="0")
+
+    assert PercentageSplit().split("25.00", values) == {
+        "Alice": Decimal("25.00"),
+        "Bob": Decimal("0.00"),
+    }
+
+
+def test_percentage_split_negative_total() -> None:
+    result = PercentageSplit().split("-50.00", percentages(Alice="60", Bob="40"))
+
+    assert result == {"Alice": Decimal("-30.00"), "Bob": Decimal("-20.00")}
+
+
+@pytest.mark.parametrize(
+    ("values", "actual_sum"),
+    [
+        (percentages(Alice="60", Bob="39.5"), "99.5"),
+        (percentages(Alice="33.33", Bob="33.33", Carol="33.33"), "99.99"),
+        (percentages(Alice="60", Bob="41"), "101"),
+        (percentages(Alice="50.001", Bob="50"), "100.001"),
+        (percentages(Alice="0", Bob="0"), "0"),
+    ],
+)
+def test_percentage_split_rejects_sum_not_100(
+    values: dict[str, Decimal], actual_sum: str
+) -> None:
+    with pytest.raises(SplitError) as excinfo:
+        PercentageSplit().split("10.00", values)
+
+    assert str(excinfo.value) == f"Percentages must sum to 100, got {actual_sum}"
+
+
+def test_percentage_split_rejects_negative_percentage() -> None:
+    with pytest.raises(SplitError, match="Percentage for 'Bob' must not be negative"):
+        PercentageSplit().split("10.00", percentages(Alice="110", Bob="-10"))
+
+
+def test_percentage_split_rejects_empty_values() -> None:
+    with pytest.raises(SplitError, match="at least one member"):
+        PercentageSplit().split("10.00", {})
+
+
+def test_percentage_split_is_registered() -> None:
+    strategy = get_strategy("percentage")
+
+    assert isinstance(strategy, PercentageSplit)
+    assert strategy.method is SplitMethod.PERCENTAGE

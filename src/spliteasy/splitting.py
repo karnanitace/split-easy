@@ -267,5 +267,52 @@ class SharesSplit(SplitStrategy):
         }
 
 
+class PercentageSplit(SplitStrategy):
+    """Divides the total by a percentage for each member.
+
+    The percentages must add up to exactly 100. They are compared as
+    ``Decimal`` values without any tolerance, so ``33.33 + 33.33 + 33.33``
+    (99.99) is rejected. Each member gets ``total * percentage / 100``, and a
+    member with 0 percent gets nothing.
+
+    Examples:
+        >>> PercentageSplit().split("50.00", {"Alice": 60, "Bob": 40})
+        {'Alice': Decimal('30.00'), 'Bob': Decimal('20.00')}
+    """
+
+    method = SplitMethod.PERCENTAGE
+
+    def raw_split(
+        self, total: Decimal, values: Mapping[str, Decimal]
+    ) -> dict[str, Decimal]:
+        """Returns ``total * percentage / 100`` for each member.
+
+        Args:
+            total: The amount to divide. It may be negative.
+            values: A non-negative percentage for each member. They must add
+                up to exactly 100.
+
+        Returns:
+            The unrounded amount for each member, in the order of ``values``.
+
+        Raises:
+            SplitError: If ``values`` is empty, a percentage is negative, or
+                the percentages do not add up to exactly 100.
+        """
+        self._require_values(values)
+        for member, percentage in values.items():
+            if percentage < 0:
+                raise SplitError(
+                    f"Percentage for {member!r} must not be negative, got {percentage}"
+                )
+        percentage_sum = sum(values.values(), Decimal(0))
+        if percentage_sum != 100:
+            raise SplitError(f"Percentages must sum to 100, got {percentage_sum}")
+        return {
+            member: total * percentage / 100 for member, percentage in values.items()
+        }
+
+
 register_strategy(EqualSplit())
 register_strategy(SharesSplit())
+register_strategy(PercentageSplit())
