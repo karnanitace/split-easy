@@ -66,6 +66,7 @@ flowchart LR
         E1(["Add expense<br/>(equal, exact, percentage,<br/>shares or itemised split)"])
         E2(["Add foreign currency expense"])
         E3(["List and delete expenses"])
+        E4(["Show expense"])
     end
 
     subgraph Settling["Settling up"]
@@ -129,6 +130,7 @@ A typical workflow, with the command for each step:
 flowchart LR
     A["Create group<br/>(group create)"] --> B["Add members<br/>(member add)"]
     B --> C["Add expenses<br/>(expense add)"]
+    C -.-> G["Show expense<br/>(expense show)"]
     C --> D["Check balances<br/>(balance)"]
     D --> E["Settle up<br/>(settle)"]
     E --> F["Record payments<br/>(pay)"]
@@ -169,11 +171,40 @@ uv run -m spliteasy settle Flat
 ```
 
 ```
-Steve -> John: 39.34 €
+Steve -> John: 58.31 €
 ```
 
 A positive balance means the member is owed money; a negative balance means
 they owe money.
+
+The flat also contains itemised receipts from Kaufland, Lidl and dm. To see
+how one was split, show it by its id:
+
+```bash
+uv run -m spliteasy expense show Flat 8
+```
+
+```
+Expense #8: Kaufland
+Date:     2026-09-08
+Category: groceries
+Amount:   30.00 €
+Paid by:  John
+Split:    itemized
+                 Breakdown
++-----------------------------------------+
+| Item                |    John |   Steve |
+|---------------------+---------+---------|
+| Vollmilch 1L x2     |  1.19 € |  1.19 € |
+| Broetchen 10 Stueck |  1.25 € |  1.25 € |
+| Olivenoel           |  3.25 € |  3.25 € |
+| Skyr x2             |       - |  2.98 € |
+| Proteinriegel x3    |  3.87 € |       - |
+| Kaffee 1kg          |  3.90 € |  9.09 € |
+| Kaufland Card       | -0.52 € | -0.68 € |
+|---------------------+---------+---------|
+| Total               | 12.93 € | 17.07 € |
++-----------------------------------------+
 
 ## Example charts
 
@@ -213,7 +244,7 @@ code 1.
 | `demo` | Create the two demo groups. |
 | `group create / list / show / delete` | Manage groups. |
 | `member add / remove` | Manage the members of a group. |
-| `expense add / list / delete` | Manage expenses. |
+| `expense add / list / show / delete` | Manage expenses. |
 | `balance` | Show what everyone paid, owes and their balance. |
 | `settle` | Suggest payments that settle all balances. |
 | `pay` | Record a payment between two members. |
@@ -283,6 +314,7 @@ semicolons: `--values "Alice=12,50;Bob=7,50"`.
 spliteasy expense list "Italy Trip"                    # all expenses, oldest first
 spliteasy expense list "Italy Trip" --member Clark     # paid by or shared by Clark
 spliteasy expense list "Italy Trip" --category food
+spliteasy expense show "Italy Trip" 3                  # details and how it was split
 spliteasy expense delete "Italy Trip" 3                # asks first; add --yes to skip
 ```
 
@@ -347,6 +379,9 @@ in proportion to what each person bought: Alice bought 60 % of the goods and
 gets 1.20 € off, Bob gets 0.80 € off, so the shares become 10.80 € and
 7.20 €. A returned bottle deposit is an item with a negative price, for
 example `--item "Deposit return:-0.25:Bob:4"`.
+
+The demo's Flat group contains similar receipts, including a Lidl receipt with
+both a bottle deposit and a deposit return (`spliteasy expense show Flat 9`).
 
 The item prices plus adjustments must add up to the amount you enter. If they
 do not, the expense is rejected with a message such as
