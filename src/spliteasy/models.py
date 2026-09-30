@@ -24,18 +24,22 @@ invalid object can never be created.
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import TypeVar
 
 from spliteasy.exceptions import DuplicateError, MemberNotFoundError, ValidationError
-from spliteasy.money import normalize_currency, parse_decimal
+from spliteasy.money import normalize_currency, parse_decimal, to_money
 
 MAX_NAME_LENGTH = 50
 """Maximum number of characters in a normalised name."""
 
+MAX_DESCRIPTION_LENGTH = 100
+"""Maximum number of characters in a normalised expense description."""
+
 E = TypeVar("E", bound=Enum)
+T = TypeVar("T")
 
 
 class SplitMethod(str, Enum):
@@ -73,7 +77,9 @@ class DistributionMode(str, Enum):
     """In equal parts."""
 
 
-def normalize_name(name: str, *, kind: str = "Name") -> str:
+def normalize_name(
+    name: str, *, kind: str = "Name", max_length: int = MAX_NAME_LENGTH
+) -> str:
     """Normalises a name and checks that it is valid.
 
     Surrounding whitespace is removed, and every run of whitespace inside the
@@ -83,13 +89,14 @@ def normalize_name(name: str, *, kind: str = "Name") -> str:
         name: The name to normalise, for example ``"  Italy   Trip "``.
         kind: What the name is for, used at the start of error messages, for
             example ``"Member name"``.
+        max_length: The maximum number of characters after normalisation.
 
     Returns:
         The normalised name, for example ``"Italy Trip"``.
 
     Raises:
         ValidationError: If ``name`` is not a string, or the normalised name
-            is empty or longer than :data:`MAX_NAME_LENGTH` characters.
+            is empty or longer than ``max_length`` characters.
 
     Examples:
         >>> normalize_name("  Italy    Trip ")
@@ -100,10 +107,9 @@ def normalize_name(name: str, *, kind: str = "Name") -> str:
     normalized = " ".join(name.split())
     if not normalized:
         raise ValidationError(f"{kind} must not be empty")
-    if len(normalized) > MAX_NAME_LENGTH:
+    if len(normalized) > max_length:
         raise ValidationError(
-            f"{kind} must be at most {MAX_NAME_LENGTH} characters, "
-            f"got {len(normalized)}"
+            f"{kind} must be at most {max_length} characters, got {len(normalized)}"
         )
     return normalized
 
@@ -566,6 +572,262 @@ class Adjustment:
         if self.kind is AdjustmentKind.DISCOUNT:
             return -self.amount
         return self.amount
+
+
+# Split methods whose split_values hold per-member amounts, percentages or weights.
+_VALUE_SPLIT_METHODS = frozenset(
+    {SplitMethod.EXACT, SplitMethod.PERCENTAGE, SplitMethod.SHARES}
+)
+
+
+@dataclass(slots=True, kw_only=True)
+class Expense:
+    """Money one member paid on behalf of a group, and how it is divided.
+
+    How the expense is divided depends on ``split_method``:
+
+    * ``EQUAL`` divides the amount equally among ``participants``. An empty
+      ``participants`` list means "all members of the group"; the service
+      layer resolves it against the group when the expense is split.
+    * ``EXACT``, ``PERCENTAGE`` and ``SHARES`` use ``split_values``, which map
+      each member to an exact amount, a percentage or a share weight.
+    * ``ITEMIZED`` uses ``items`` and ``adjustments`` from a receipt.
+
+    The result of splitting is stored in ``shares`` by the service layer. The
+    fields are validated when the expense is created; code that changes an
+    expense later is responsible for keeping it consistent.
+
+    Attributes:
+        description: What the expense was for, normalised with
+            :func:`normalize_name` (at most :data:`MAX_DESCRIPTION_LENGTH`
+            characters).
+        amount: The amount paid in ``currency``, rounded to its minor unit.
+            It must be greater than zero.
+        payer: The name of the member who paid.
+        currency: The ISO 4217 code of ``amount``.
+        split_method: How the amount is divided.
+        participants: For EQUAL splits, the members who share the expense.
+            Empty means all members of the group.
+        split_values: For EXACT, PERCENTAGE and SHARES splits, a
+            non-negative value by member name.
+        items: For ITEMIZED splits, the receipt's line items.
+        adjustments: For ITEMIZED splits, receipt-level discounts and fees.
+        category: The expense category, stripped and in lower case.
+        date: The day the expense was made.
+        rate_to_base: The exchange rate from ``currency`` to the group's base
+            currency, fixed when the expense is entered. It must be greater
+            than zero.
+        shares: The computed share of each member, filled in by the service.
+        note: An optional free-text note, stripped of surrounding whitespace.
+        id: The database id, or ``None`` if the expense has not been saved.
+        group_id: The id of the group the expense belongs to, or ``None``.
+    """
+
+    description: str
+    amount: Decimal
+    payer: str
+    currency: str = "EUR"
+    split_method: SplitMethod = SplitMethod.EQUAL
+    participants: list[str] = field(default_factory=list)
+    split_values: dict[str, Decimal] = field(default_factory=dict)
+    items: list[LineItem] = field(default_factory=list)
+    adjustments: list[Adjustment] = field(default_factory=list)
+    category: str = "other"
+    date: date = field(default_factory=date.today)
+    rate_to_base: Decimal = Decimal("1")
+    shares: list[Share] = field(default_factory=list)
+    note: str = ""
+    id: int | None = None
+    group_id: int | None = None
+
+    def __post_init__(self) -> None:
+        """Normalises and validates all fields and checks their consistency.
+
+        Raises:
+            ValidationError: If a field is invalid or the fields do not match
+                the split method.
+            InvalidAmountError: If the amount, a split value or the exchange
+                rate cannot be parsed.
+            CurrencyError: If the currency code is malformed.
+        """
+        self.description = normalize_name(
+            self.description, kind="Description", max_length=MAX_DESCRIPTION_LENGTH
+        )
+        self.currency = normalize_currency(self.currency)
+        self.amount = to_money(self.amount, self.currency)
+        if self.amount <= 0:
+            raise ValidationError(
+                f"Amount of expense {self.description!r} must be greater than zero, "
+                f"got {self.amount}"
+            )
+        self.payer = normalize_name(self.payer, kind="Payer name")
+        self.split_method = _to_enum(SplitMethod, self.split_method, "split method")
+
+        self.participants = [
+            normalize_name(name, kind="Participant name") for name in self.participants
+        ]
+        _check_unique_names(self.participants, context="participants")
+        self.split_values = self._normalize_split_values()
+        self.items = _check_instances(self.items, LineItem, "items")
+        self.adjustments = _check_instances(self.adjustments, Adjustment, "adjustments")
+        self.shares = _check_instances(self.shares, Share, "shares")
+        _check_unique_names((share.member for share in self.shares), context="shares")
+
+        category = _normalize_category(self.category)
+        if category is None:
+            raise ValidationError("Expense category must not be empty")
+        self.category = category
+
+        if isinstance(self.date, datetime) or not isinstance(self.date, date):
+            raise ValidationError(f"Expense date must be a date, got {self.date!r}")
+
+        self.rate_to_base = parse_decimal(self.rate_to_base)
+        if self.rate_to_base <= 0:
+            raise ValidationError(
+                f"Exchange rate must be greater than zero, got {self.rate_to_base}"
+            )
+
+        if not isinstance(self.note, str):
+            raise ValidationError(f"Expense note must be a string, got {self.note!r}")
+        self.note = self.note.strip()
+
+        self._check_split_consistency()
+
+    @property
+    def items_total(self) -> Decimal:
+        """The sum of the item totals plus the signed adjustments.
+
+        This is ``Decimal("0")`` if the expense has no items.
+        """
+        if not self.items:
+            return Decimal("0")
+        items = sum((item.total for item in self.items), Decimal("0"))
+        adjustments = sum(
+            (adjustment.signed_amount for adjustment in self.adjustments), Decimal("0")
+        )
+        return items + adjustments
+
+    @property
+    def involved_members(self) -> list[str]:
+        """Every member name that appears anywhere in the expense.
+
+        The payer comes first, followed by names from ``participants``,
+        ``split_values``, item assignees and ``shares``, in that order. Each
+        name appears once (ignoring case), with the spelling of its first
+        appearance.
+        """
+        names = [
+            self.payer,
+            *self.participants,
+            *self.split_values,
+            *(member for item in self.items for member in item.assignees),
+            *(share.member for share in self.shares),
+        ]
+        first_seen: dict[str, str] = {}
+        for name in names:
+            first_seen.setdefault(name.casefold(), name)
+        return list(first_seen.values())
+
+    def base_amount(self, base_currency: str) -> Decimal:
+        """Returns the amount converted to the group's base currency.
+
+        Args:
+            base_currency: The ISO 4217 code of the group's base currency.
+
+        Returns:
+            ``amount * rate_to_base``, rounded to the base currency's minor
+            unit.
+
+        Raises:
+            CurrencyError: If the currency code is malformed.
+        """
+        return to_money(self.amount * self.rate_to_base, base_currency)
+
+    def share_of(self, member: str) -> Decimal:
+        """Returns a member's computed share of the expense.
+
+        Args:
+            member: The member's name, ignoring case and extra whitespace.
+
+        Returns:
+            The amount from ``shares``, or ``Decimal("0")`` if the member has
+            no share.
+        """
+        wanted = " ".join(member.split()).casefold()
+        for share in self.shares:
+            if share.member.casefold() == wanted:
+                return share.amount
+        return Decimal("0")
+
+    def _normalize_split_values(self) -> dict[str, Decimal]:
+        """Returns ``split_values`` with normalised names and parsed values.
+
+        Raises:
+            ValidationError: If ``split_values`` is not a mapping, a name is
+                invalid or appears twice (ignoring case), or a value is
+                negative.
+            InvalidAmountError: If a value cannot be parsed.
+        """
+        if not isinstance(self.split_values, Mapping):
+            raise ValidationError("Split values must be a mapping of names to values")
+        pairs: list[tuple[str, Decimal]] = []
+        for raw_name, raw_value in self.split_values.items():
+            member = normalize_name(raw_name, kind="Member name")
+            value = parse_decimal(raw_value)
+            if value < 0:
+                raise ValidationError(
+                    f"Split value for {member!r} must not be negative, got {value}"
+                )
+            pairs.append((member, value))
+        _check_unique_names((member for member, _ in pairs), context="split values")
+        return dict(pairs)
+
+    def _check_split_consistency(self) -> None:
+        """Checks that the fields in use match the split method.
+
+        Raises:
+            ValidationError: If the split method is missing data it needs or
+                has data that belongs to another method.
+        """
+        method = self.split_method.value
+        if self.split_method is SplitMethod.ITEMIZED:
+            if not self.items:
+                raise ValidationError("An itemized expense needs at least one item")
+            return
+        if self.items or self.adjustments:
+            raise ValidationError(
+                f"A {method!r} expense must not have items or adjustments"
+            )
+        if self.split_method in _VALUE_SPLIT_METHODS and not self.split_values:
+            raise ValidationError(f"A {method!r} expense needs split values")
+        if self.split_method is SplitMethod.EQUAL and self.split_values:
+            raise ValidationError(
+                "An 'equal' expense must not have split values; use participants"
+            )
+
+
+def _check_instances(values: Iterable[object], cls: type[T], what: str) -> list[T]:
+    """Returns the values as a new list after checking their type.
+
+    Args:
+        values: The values to check.
+        cls: The class every value must be an instance of.
+        what: The name of the field, used in error messages.
+
+    Returns:
+        A new list with the same values.
+
+    Raises:
+        ValidationError: If a value is not an instance of ``cls``.
+    """
+    checked: list[T] = []
+    for value in values:
+        if not isinstance(value, cls):
+            raise ValidationError(
+                f"Expense {what} must be {cls.__name__} objects, got {value!r}"
+            )
+        checked.append(value)
+    return checked
 
 
 def _to_enum(enum_type: type[E], value: object, what: str) -> E:

@@ -1,6 +1,6 @@
 import dataclasses
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 
@@ -14,10 +14,12 @@ from spliteasy.exceptions import (
     ValidationError,
 )
 from spliteasy.models import (
+    MAX_DESCRIPTION_LENGTH,
     MAX_NAME_LENGTH,
     Adjustment,
     AdjustmentKind,
     DistributionMode,
+    Expense,
     Group,
     LineItem,
     Member,
@@ -689,3 +691,342 @@ def test_adjustment_is_frozen_value_object() -> None:
     )
     with pytest.raises(dataclasses.FrozenInstanceError):
         adjustment.amount = Decimal(2)  # type: ignore[misc]
+
+
+# normalize_name max_length
+
+
+def test_normalize_name_accepts_custom_max_length() -> None:
+    long_name = "a" * 80
+
+    assert normalize_name(long_name, max_length=100) == long_name
+    with pytest.raises(ValidationError, match="at most 10 characters, got 11"):
+        normalize_name("a" * 11, kind="Name", max_length=10)
+
+
+# Expense
+
+
+def make_expense(**overrides: object) -> Expense:
+    fields: dict[str, object] = {
+        "description": "Dinner",
+        "amount": Decimal("30.00"),
+        "payer": "Alice",
+    }
+    fields.update(overrides)
+    return Expense(**fields)  # type: ignore[arg-type]
+
+
+@pytest.fixture
+def kaufland() -> Expense:
+    return make_expense(
+        description="Kaufland",
+        amount="20.00",
+        split_method="itemized",
+        category="groceries",
+        items=[
+            LineItem.for_members("Olive oil", "6.00", ["Alice", "Bob"]),
+            LineItem.for_members("Protein bars", "5.00", ["Alice"]),
+            LineItem.for_members("Yogurt", "4.00", ["Alice"]),
+            LineItem.for_members("Coffee", "5.00", ["Bob"]),
+        ],
+    )
+
+
+def test_simple_equal_expense() -> None:
+    expense = make_expense(participants=["Alice", " bob "])
+
+    assert expense.description == "Dinner"
+    assert expense.amount == Decimal("30.00")
+    assert expense.payer == "Alice"
+    assert expense.currency == "EUR"
+    assert expense.split_method is SplitMethod.EQUAL
+    assert expense.participants == ["Alice", "bob"]
+    assert expense.split_values == {}
+    assert expense.items == []
+    assert expense.adjustments == []
+    assert expense.category == "other"
+    assert expense.rate_to_base == Decimal("1")
+    assert expense.shares == []
+    assert expense.note == ""
+    assert expense.id is None
+    assert expense.group_id is None
+
+
+def test_expense_defaults_date_to_today_and_participants_to_all() -> None:
+    expense = make_expense()
+
+    assert expense.date == date.today()
+    assert expense.participants == []
+
+
+def test_expense_normalizes_fields() -> None:
+    expense = make_expense(
+        description="  Dinner   at  Mario's ",
+        amount="30,555",
+        payer="  Alice ",
+        currency=" eur ",
+        category="  Food ",
+        note="  split later ",
+        date=date(2026, 9, 1),
+    )
+
+    assert expense.description == "Dinner at Mario's"
+    assert expense.amount == Decimal("30.56")
+    assert expense.payer == "Alice"
+    assert expense.currency == "EUR"
+    assert expense.category == "food"
+    assert expense.note == "split later"
+    assert expense.date == date(2026, 9, 1)
+
+
+def test_expense_rounds_amount_to_currency_minor_unit() -> None:
+    assert make_expense(amount="1500.4", currency="JPY").amount == Decimal("1500")
+
+
+def test_expense_allows_long_descriptions_up_to_limit() -> None:
+    description = "d" * MAX_DESCRIPTION_LENGTH
+
+    assert make_expense(description=description).description == description
+    with pytest.raises(ValidationError, match="^Description must be at most 100"):
+        make_expense(description=description + "d")
+
+
+def test_foreign_currency_expense_base_amount() -> None:
+    expense = make_expense(amount="100.00", currency="CHF", rate_to_base="1.0612")
+
+    assert expense.amount == Decimal("100.00")
+    assert expense.rate_to_base == Decimal("1.0612")
+    assert expense.base_amount("EUR") == Decimal("106.12")
+
+
+def test_base_amount_rounds_half_up_to_base_currency() -> None:
+    expense = make_expense(amount="10.00", currency="USD", rate_to_base="0.92345")
+
+    assert expense.base_amount("EUR") == Decimal("9.23")
+    assert expense.base_amount("JPY") == Decimal("9")
+
+
+def test_base_amount_with_default_rate_is_amount() -> None:
+    assert make_expense().base_amount("eur") == Decimal("30.00")
+
+
+def test_expense_accepts_string_split_method_and_parses_values() -> None:
+    expense = make_expense(
+        split_method="percentage", split_values={" Alice ": "60", "Bob": 40}
+    )
+
+    assert expense.split_method is SplitMethod.PERCENTAGE
+    assert expense.split_values == {"Alice": Decimal(60), "Bob": Decimal(40)}
+
+
+@pytest.mark.parametrize("amount", [0, "0.00", "-5", "0.004"])
+def test_expense_rejects_non_positive_amount(amount: object) -> None:
+    with pytest.raises(ValidationError, match="greater than zero"):
+        make_expense(amount=amount)
+
+
+def test_expense_rejects_unparsable_amount() -> None:
+    with pytest.raises(InvalidAmountError):
+        make_expense(amount="thirty")
+
+
+def test_expense_rejects_invalid_currency() -> None:
+    with pytest.raises(CurrencyError):
+        make_expense(currency="EURO")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"description": "  "}, "^Description must not be empty$"),
+        ({"payer": ""}, "^Payer name must not be empty$"),
+        ({"participants": ["Alice", ""]}, "^Participant name must not be empty$"),
+        ({"participants": ["Alice", "alice"]}, "appears more than once"),
+        ({"split_method": "weighted"}, "Invalid split method"),
+        ({"category": "   "}, "category must not be empty"),
+        ({"category": None}, "category must not be empty"),
+        ({"date": "2026-09-01"}, "must be a date"),
+        ({"date": datetime(2026, 9, 1)}, "must be a date"),
+        ({"rate_to_base": 0}, "Exchange rate must be greater than zero"),
+        ({"rate_to_base": "-1.1"}, "Exchange rate must be greater than zero"),
+        ({"note": None}, "note must be a string"),
+        ({"items": ["Milk"]}, "must be LineItem objects"),
+        ({"shares": [("Alice", 1)]}, "must be Share objects"),
+    ],
+)
+def test_expense_rejects_invalid_fields(
+    overrides: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        make_expense(**overrides)
+
+
+@pytest.mark.parametrize(
+    "split_values",
+    [
+        {"Alice": 1, "Bob": -1},
+        {"Alice": 1, "alice": 2},
+        {"  ": 1},
+    ],
+)
+def test_expense_rejects_invalid_split_values(split_values: dict[str, int]) -> None:
+    with pytest.raises(ValidationError):
+        make_expense(split_method="shares", split_values=split_values)
+
+
+def test_expense_rejects_duplicate_share_members() -> None:
+    with pytest.raises(ValidationError, match="appears more than once in shares"):
+        make_expense(shares=[Share("Alice", Decimal(1)), Share("ALICE", Decimal(2))])
+
+
+def test_expense_copies_input_lists() -> None:
+    participants = ["Alice"]
+
+    expense = make_expense(participants=participants)
+    participants.append("Bob")
+
+    assert expense.participants == ["Alice"]
+
+
+# Consistency rules
+
+
+def test_itemized_expense_requires_items() -> None:
+    with pytest.raises(ValidationError, match="needs at least one item"):
+        make_expense(split_method=SplitMethod.ITEMIZED)
+
+
+@pytest.mark.parametrize("method", ["equal", "exact", "percentage", "shares"])
+def test_non_itemized_expense_rejects_items(method: str) -> None:
+    item = LineItem.for_members("Milk", "1.29", ["Alice"])
+
+    with pytest.raises(ValidationError, match="must not have items or adjustments"):
+        make_expense(split_method=method, split_values={"Alice": 1}, items=[item])
+
+
+@pytest.mark.parametrize("method", ["equal", "exact", "percentage", "shares"])
+def test_non_itemized_expense_rejects_adjustments(method: str) -> None:
+    fee = Adjustment(kind=AdjustmentKind.FEE, amount=Decimal(1))
+
+    with pytest.raises(ValidationError, match="must not have items or adjustments"):
+        make_expense(split_method=method, split_values={"Alice": 1}, adjustments=[fee])
+
+
+@pytest.mark.parametrize("method", ["exact", "percentage", "shares"])
+def test_value_split_methods_require_split_values(method: str) -> None:
+    with pytest.raises(ValidationError, match="needs split values"):
+        make_expense(split_method=method)
+
+
+def test_equal_expense_rejects_split_values() -> None:
+    with pytest.raises(ValidationError, match="must not have split values"):
+        make_expense(split_values={"Alice": 1})
+
+
+@pytest.mark.parametrize("method", ["exact", "percentage", "shares"])
+def test_value_split_methods_accept_split_values(method: str) -> None:
+    expense = make_expense(split_method=method, split_values={"Alice": 10, "Bob": 20})
+
+    assert expense.split_values == {"Alice": Decimal(10), "Bob": Decimal(20)}
+
+
+# Itemized expenses
+
+
+def test_itemized_kaufland_expense(kaufland: Expense) -> None:
+    assert kaufland.split_method is SplitMethod.ITEMIZED
+    assert kaufland.amount == Decimal("20.00")
+    assert len(kaufland.items) == 4
+    assert kaufland.items_total == Decimal("20.00")
+    assert kaufland.items_total == kaufland.amount
+
+
+def test_items_total_includes_signed_adjustments() -> None:
+    expense = make_expense(
+        split_method="itemized",
+        items=[LineItem.for_members("Pizza", "12.00", ["Alice"], quantity=2)],
+        adjustments=[
+            Adjustment(kind=AdjustmentKind.DISCOUNT, amount=Decimal("5.00")),
+            Adjustment(kind=AdjustmentKind.FEE, amount=Decimal("2.50")),
+            Adjustment(kind=AdjustmentKind.DEPOSIT, amount=Decimal("0.25")),
+        ],
+    )
+
+    assert expense.items_total == Decimal("21.75")
+
+
+def test_items_total_includes_negative_item_prices() -> None:
+    expense = make_expense(
+        split_method="itemized",
+        items=[
+            LineItem.for_members("Water", "0.49", ["Alice"], quantity=6),
+            LineItem.for_members("Deposit return", "-0.25", ["Alice"], quantity=4),
+        ],
+    )
+
+    assert expense.items_total == Decimal("1.94")
+
+
+def test_items_total_is_zero_without_items() -> None:
+    total = make_expense().items_total
+
+    assert total == 0
+    assert isinstance(total, Decimal)
+
+
+# involved_members and share_of
+
+
+def test_involved_members_in_first_seen_order() -> None:
+    expense = make_expense(
+        payer="Dave",
+        split_method="itemized",
+        items=[
+            LineItem.for_members("Bread", "2.00", ["Carol", "alice"]),
+            LineItem.for_members("Milk", "1.00", ["Bob", "DAVE"]),
+        ],
+        shares=[Share("Eve", Decimal(1)), Share("Carol", Decimal(2))],
+    )
+
+    assert expense.involved_members == ["Dave", "Carol", "alice", "Bob", "Eve"]
+
+
+def test_involved_members_covers_participants_and_split_values() -> None:
+    equal = make_expense(payer="Alice", participants=["Bob", "alice", "Carol"])
+    shares = make_expense(
+        payer="Bob", split_method="shares", split_values={"Alice": 1, "bob": 2}
+    )
+
+    assert equal.involved_members == ["Alice", "Bob", "Carol"]
+    assert shares.involved_members == ["Bob", "Alice"]
+
+
+def test_involved_members_of_kaufland(kaufland: Expense) -> None:
+    assert kaufland.involved_members == ["Alice", "Bob"]
+
+
+def test_share_of_is_case_insensitive() -> None:
+    expense = make_expense(
+        shares=[Share("Alice", Decimal("12.50")), Share("Bob", Decimal("17.50"))]
+    )
+
+    assert expense.share_of("Alice") == Decimal("12.50")
+    assert expense.share_of(" BOB ") == Decimal("17.50")
+
+
+def test_share_of_missing_member_is_zero() -> None:
+    expense = make_expense(shares=[Share("Alice", Decimal("30.00"))])
+
+    assert expense.share_of("Carol") == Decimal("0")
+    assert make_expense().share_of("Alice") == Decimal("0")
+
+
+def test_expense_is_mutable_entity() -> None:
+    expense = make_expense()
+
+    expense.shares = [Share("Alice", Decimal("30.00"))]
+    expense.id = 1
+
+    assert expense.share_of("Alice") == Decimal("30.00")
+    assert not hasattr(expense, "__dict__")
