@@ -1,6 +1,7 @@
 import dataclasses
 import json
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from enum import Enum
 
 import pytest
@@ -8,15 +9,19 @@ import pytest
 from spliteasy.exceptions import (
     CurrencyError,
     DuplicateError,
+    InvalidAmountError,
     MemberNotFoundError,
     ValidationError,
 )
 from spliteasy.models import (
     MAX_NAME_LENGTH,
+    Adjustment,
     AdjustmentKind,
     DistributionMode,
     Group,
+    LineItem,
     Member,
+    Share,
     SplitMethod,
     normalize_name,
 )
@@ -340,3 +345,347 @@ def test_resolve_name_returns_stored_spelling(
 def test_resolve_name_raises_for_missing_member(flat: Group) -> None:
     with pytest.raises(MemberNotFoundError, match="Member 'Carol' not found"):
         flat.resolve_name("Carol")
+
+
+# Share
+
+
+def test_share_normalizes_member_and_parses_amount() -> None:
+    share = Share(" Alice ", "12,50")  # type: ignore[arg-type]
+
+    assert share.member == "Alice"
+    assert share.amount == Decimal("12.50")
+
+
+def test_share_allows_zero_amount() -> None:
+    assert Share("Alice", Decimal(0)).amount == 0
+
+
+def test_share_keeps_unrounded_amount() -> None:
+    assert Share("Alice", Decimal("3.333")).amount == Decimal("3.333")
+
+
+def test_share_rejects_negative_amount() -> None:
+    with pytest.raises(ValidationError, match="must not be negative"):
+        Share("Alice", Decimal("-0.01"))
+
+
+@pytest.mark.parametrize("amount", ["abc", "NaN", True])
+def test_share_rejects_unparsable_amount(amount: object) -> None:
+    with pytest.raises(InvalidAmountError):
+        Share("Alice", amount)  # type: ignore[arg-type]
+
+
+def test_share_rejects_empty_member() -> None:
+    with pytest.raises(ValidationError, match="^Member name must not be empty$"):
+        Share("  ", Decimal(1))
+
+
+def test_share_is_frozen_value_object() -> None:
+    share = Share("Alice", Decimal("1.00"))
+
+    assert share == Share("Alice", Decimal("1.00"))
+    assert len({share, Share("Alice", Decimal("1.00"))}) == 1
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        share.amount = Decimal(2)  # type: ignore[misc]
+
+
+# LineItem
+
+
+def make_item(**overrides: object) -> LineItem:
+    fields: dict[str, object] = {
+        "name": "Milk",
+        "price": Decimal("1.29"),
+        "assignees": {"Alice": Decimal(1)},
+    }
+    fields.update(overrides)
+    return LineItem(**fields)  # type: ignore[arg-type]
+
+
+def test_line_item_normalizes_and_parses_fields() -> None:
+    item = make_item(
+        name="  Oat   Milk ",
+        price="1,29",
+        quantity=3,
+        assignees={" Alice ": 1, "Bob": "2.5"},
+        split_method="shares",
+        category="  Dairy ",
+    )
+
+    assert item.name == "Oat Milk"
+    assert item.price == Decimal("1.29")
+    assert item.quantity == 3
+    assert item.assignees == {"Alice": Decimal(1), "Bob": Decimal("2.5")}
+    assert all(isinstance(w, Decimal) for w in item.assignees.values())
+    assert item.split_method is SplitMethod.SHARES
+    assert item.category == "dairy"
+
+
+def test_line_item_defaults() -> None:
+    item = make_item()
+
+    assert item.quantity == 1
+    assert item.split_method is SplitMethod.EQUAL
+    assert item.category is None
+
+
+def test_line_item_total_is_price_times_quantity() -> None:
+    assert make_item(price="1.29", quantity=3).total == Decimal("3.87")
+
+
+def test_line_item_allows_negative_price_for_deposit_return() -> None:
+    item = make_item(name="Bottle deposit return", price="-0.25", quantity=4)
+
+    assert item.price == Decimal("-0.25")
+    assert item.total == Decimal("-1.00")
+
+
+def test_line_item_stores_assignees_as_new_dict() -> None:
+    assignees = {"Alice": Decimal(1)}
+
+    item = make_item(assignees=assignees)
+    assignees["Bob"] = Decimal(1)
+
+    assert type(item.assignees) is dict
+    assert item.assignees == {"Alice": Decimal(1)}
+
+
+def test_line_item_keeps_assignee_order_and_zero_weights() -> None:
+    item = make_item(assignees={"Carol": 0, "Alice": 1, "Bob": 2})
+
+    assert list(item.assignees) == ["Carol", "Alice", "Bob"]
+    assert item.assignees["Carol"] == 0
+
+
+def test_line_item_is_frozen_and_unhashable() -> None:
+    item = make_item()
+
+    assert item == make_item()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        item.price = Decimal(2)  # type: ignore[misc]
+    with pytest.raises(TypeError, match="unhashable"):
+        hash(item)
+
+
+@pytest.mark.parametrize(
+    ("method", "expected"),
+    [
+        ("equal", SplitMethod.EQUAL),
+        ("exact", SplitMethod.EXACT),
+        ("percentage", SplitMethod.PERCENTAGE),
+        ("shares", SplitMethod.SHARES),
+        (SplitMethod.SHARES, SplitMethod.SHARES),
+    ],
+)
+def test_line_item_converts_split_method(method: object, expected: SplitMethod) -> None:
+    assert make_item(split_method=method).split_method is expected
+
+
+@pytest.mark.parametrize("method", [SplitMethod.ITEMIZED, "itemized"])
+def test_line_item_rejects_itemized_split_method(method: object) -> None:
+    with pytest.raises(ValidationError, match="not allowed for a line item"):
+        make_item(split_method=method)
+
+
+def test_line_item_rejects_unknown_split_method() -> None:
+    with pytest.raises(ValidationError, match="Invalid split method 'weighted'"):
+        make_item(split_method="weighted")
+
+
+@pytest.mark.parametrize("category", ["", "   "])
+def test_line_item_treats_blank_category_as_none(category: str) -> None:
+    assert make_item(category=category).category is None
+
+
+def test_line_item_rejects_non_string_category() -> None:
+    with pytest.raises(ValidationError, match="Category must be a string"):
+        make_item(category=42)
+
+
+@pytest.mark.parametrize("name", ["", "   ", "a" * (MAX_NAME_LENGTH + 1)])
+def test_line_item_rejects_invalid_name(name: str) -> None:
+    with pytest.raises(ValidationError, match="^Item name"):
+        make_item(name=name)
+
+
+@pytest.mark.parametrize("price", [0, "0.00", Decimal("-0")])
+def test_line_item_rejects_zero_price(price: object) -> None:
+    with pytest.raises(ValidationError, match="must not be zero"):
+        make_item(price=price)
+
+
+@pytest.mark.parametrize("price", ["abc", "Infinity", None])
+def test_line_item_rejects_unparsable_price(price: object) -> None:
+    with pytest.raises(InvalidAmountError):
+        make_item(price=price)
+
+
+@pytest.mark.parametrize("quantity", [0, -1])
+def test_line_item_rejects_quantity_below_one(quantity: int) -> None:
+    with pytest.raises(ValidationError, match="at least 1"):
+        make_item(quantity=quantity)
+
+
+@pytest.mark.parametrize("quantity", [True, 1.0, "2", None])
+def test_line_item_rejects_non_integer_quantity(quantity: object) -> None:
+    with pytest.raises(ValidationError, match="must be an integer"):
+        make_item(quantity=quantity)
+
+
+def test_line_item_rejects_empty_assignees() -> None:
+    with pytest.raises(ValidationError, match="at least one assignee"):
+        make_item(assignees={})
+
+
+def test_line_item_rejects_non_mapping_assignees() -> None:
+    with pytest.raises(ValidationError, match="must be a mapping"):
+        make_item(assignees=["Alice", "Bob"])
+
+
+def test_line_item_rejects_all_zero_weights() -> None:
+    with pytest.raises(ValidationError, match="At least one weight"):
+        make_item(assignees={"Alice": 0, "Bob": Decimal("0.0")})
+
+
+def test_line_item_rejects_negative_weight() -> None:
+    with pytest.raises(ValidationError, match="must not be negative"):
+        make_item(assignees={"Alice": 1, "Bob": -1})
+
+
+def test_line_item_rejects_unparsable_weight() -> None:
+    with pytest.raises(InvalidAmountError):
+        make_item(assignees={"Alice": "lots"})
+
+
+@pytest.mark.parametrize(
+    "assignees",
+    [
+        {"Alice": 1, "alice": 1},
+        {"Alice": 1, " ALICE ": 2},
+        {"Alice": 1, "Alice  ": 1},
+    ],
+)
+def test_line_item_rejects_duplicate_assignees(assignees: dict[str, int]) -> None:
+    with pytest.raises(ValidationError, match="appears more than once"):
+        make_item(assignees=assignees)
+
+
+def test_line_item_rejects_invalid_assignee_name() -> None:
+    with pytest.raises(ValidationError, match="^Member name must not be empty$"):
+        make_item(assignees={"  ": 1})
+
+
+def test_for_members_alice_and_bob() -> None:
+    item = LineItem.for_members("Pizza", "12.00", ["Alice", "Bob"])
+
+    assert item.name == "Pizza"
+    assert item.price == Decimal("12.00")
+    assert item.quantity == 1
+    assert item.assignees == {"Alice": Decimal(1), "Bob": Decimal(1)}
+    assert item.split_method is SplitMethod.EQUAL
+    assert item.category is None
+
+
+def test_for_members_passes_quantity_and_category() -> None:
+    item = LineItem.for_members(
+        "Beer", Decimal("1.10"), ["Alice"], quantity=6, category="Drinks"
+    )
+
+    assert item.total == Decimal("6.60")
+    assert item.category == "drinks"
+
+
+def test_for_members_rejects_empty_members() -> None:
+    with pytest.raises(ValidationError, match="at least one assignee"):
+        LineItem.for_members("Pizza", "12.00", [])
+
+
+@pytest.mark.parametrize("members", [["Alice", "Alice"], ["Alice", " alice"]])
+def test_for_members_rejects_duplicate_members(members: list[str]) -> None:
+    with pytest.raises(ValidationError, match="appears more than once"):
+        LineItem.for_members("Pizza", "12.00", members)
+
+
+# Adjustment
+
+
+def test_adjustment_converts_strings_and_parses_amount() -> None:
+    adjustment = Adjustment(
+        kind="fee",  # type: ignore[arg-type]
+        amount="3,50",  # type: ignore[arg-type]
+        distribute="equal",  # type: ignore[arg-type]
+        description="  Delivery ",
+    )
+
+    assert adjustment.kind is AdjustmentKind.FEE
+    assert adjustment.amount == Decimal("3.50")
+    assert adjustment.distribute is DistributionMode.EQUAL
+    assert adjustment.description == "Delivery"
+
+
+def test_adjustment_defaults() -> None:
+    adjustment = Adjustment(kind=AdjustmentKind.DISCOUNT, amount=Decimal(5))
+
+    assert adjustment.distribute is DistributionMode.PROPORTIONAL
+    assert adjustment.description == ""
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        (AdjustmentKind.DISCOUNT, Decimal("-5.00")),
+        (AdjustmentKind.FEE, Decimal("5.00")),
+        (AdjustmentKind.DEPOSIT, Decimal("5.00")),
+        ("discount", Decimal("-5.00")),
+    ],
+)
+def test_adjustment_signed_amount(kind: object, expected: Decimal) -> None:
+    adjustment = Adjustment(kind=kind, amount=Decimal("5.00"))  # type: ignore[arg-type]
+
+    assert adjustment.signed_amount == expected
+
+
+@pytest.mark.parametrize("amount", [0, "0.00", "-1"])
+def test_adjustment_rejects_non_positive_amount(amount: object) -> None:
+    with pytest.raises(ValidationError, match="greater than zero"):
+        Adjustment(kind=AdjustmentKind.FEE, amount=amount)  # type: ignore[arg-type]
+
+
+def test_adjustment_rejects_unparsable_amount() -> None:
+    with pytest.raises(InvalidAmountError):
+        Adjustment(kind=AdjustmentKind.FEE, amount="free")  # type: ignore[arg-type]
+
+
+def test_adjustment_rejects_unknown_kind() -> None:
+    with pytest.raises(ValidationError, match="Invalid adjustment kind 'tip'"):
+        Adjustment(kind="tip", amount=Decimal(1))  # type: ignore[arg-type]
+
+
+def test_adjustment_rejects_unknown_distribution_mode() -> None:
+    with pytest.raises(ValidationError, match="Invalid distribution mode"):
+        Adjustment(
+            kind=AdjustmentKind.FEE,
+            amount=Decimal(1),
+            distribute="weighted",  # type: ignore[arg-type]
+        )
+
+
+def test_adjustment_rejects_non_string_description() -> None:
+    with pytest.raises(ValidationError, match="description must be a string"):
+        Adjustment(
+            kind=AdjustmentKind.FEE,
+            amount=Decimal(1),
+            description=None,  # type: ignore[arg-type]
+        )
+
+
+def test_adjustment_is_frozen_value_object() -> None:
+    adjustment = Adjustment(kind=AdjustmentKind.FEE, amount=Decimal(1))
+
+    assert adjustment == Adjustment(kind="fee", amount="1")  # type: ignore[arg-type]
+    assert (
+        len({adjustment, Adjustment(kind=AdjustmentKind.FEE, amount=Decimal(1))}) == 1
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        adjustment.amount = Decimal(2)  # type: ignore[misc]
