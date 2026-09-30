@@ -1,14 +1,11 @@
 from pathlib import Path
 
 import pytest
-from typer.testing import CliRunner, Result
 
-from spliteasy.cli.app import app
 from spliteasy.services import GroupService
 from spliteasy.storage import SQLiteRepository
 from spliteasy.storage.sqlite import DB_ENV_VAR
-
-runner = CliRunner()
+from tests.conftest import invoke
 
 
 @pytest.fixture
@@ -16,12 +13,8 @@ def db_path(tmp_path: Path) -> Path:
     return tmp_path / "cli.db"
 
 
-def run(db_path: Path, *args: str, input: str | None = None) -> Result:
-    return runner.invoke(app, ["--db", str(db_path), *args], input=input)
-
-
 def create_flat(db_path: Path) -> None:
-    result = run(db_path, "group", "create", "Flat", "-m", "Alice", "-m", "Bob")
+    result = invoke(db_path, "group", "create", "Flat", "-m", "Alice", "-m", "Bob")
     assert result.exit_code == 0, result.output
 
 
@@ -39,7 +32,7 @@ def stored_members(db_path: Path, group: str) -> list[str]:
 
 
 def test_group_create(db_path: Path) -> None:
-    result = run(
+    result = invoke(
         db_path,
         "group",
         "create",
@@ -56,7 +49,7 @@ def test_group_create(db_path: Path) -> None:
 
 
 def test_group_create_without_members(db_path: Path) -> None:
-    result = run(db_path, "group", "create", "Flat")
+    result = invoke(db_path, "group", "create", "Flat")
 
     assert result.exit_code == 0
     assert "(EUR) with members: -" in result.output
@@ -65,7 +58,7 @@ def test_group_create_without_members(db_path: Path) -> None:
 def test_group_create_duplicate_is_an_error(db_path: Path) -> None:
     create_flat(db_path)
 
-    result = run(db_path, "group", "create", "FLAT")
+    result = invoke(db_path, "group", "create", "FLAT")
 
     assert result.exit_code == 1
     assert "Error: A group named 'FLAT' already exists" in result.stderr
@@ -73,7 +66,7 @@ def test_group_create_duplicate_is_an_error(db_path: Path) -> None:
 
 
 def test_group_create_invalid_currency_is_an_error(db_path: Path) -> None:
-    result = run(db_path, "group", "create", "Flat", "--currency", "EURO")
+    result = invoke(db_path, "group", "create", "Flat", "--currency", "EURO")
 
     assert result.exit_code == 1
     assert "Invalid currency code 'EURO'" in result.stderr
@@ -85,9 +78,9 @@ def test_group_create_invalid_currency_is_an_error(db_path: Path) -> None:
 
 def test_group_list(db_path: Path) -> None:
     create_flat(db_path)
-    run(db_path, "group", "create", "Trip", "--currency", "JPY")
+    invoke(db_path, "group", "create", "Trip", "--currency", "JPY")
 
-    result = run(db_path, "group", "list")
+    result = invoke(db_path, "group", "list")
 
     assert result.exit_code == 0
     lines = result.output.splitlines()
@@ -103,14 +96,14 @@ def test_group_list_counts_expenses(db_path: Path) -> None:
         service.add_expense("Flat", "Pizza", "20", "Alice")
         service.add_expense("Flat", "Taxi", "10", "Bob")
 
-    result = run(db_path, "group", "list")
+    result = invoke(db_path, "group", "list")
 
     flat_line = next(line for line in result.output.splitlines() if "Flat" in line)
     assert flat_line.rstrip(" |").endswith("2")
 
 
 def test_group_list_when_empty(db_path: Path) -> None:
-    result = run(db_path, "group", "list")
+    result = invoke(db_path, "group", "list")
 
     assert result.exit_code == 0
     assert "No groups yet" in result.output
@@ -119,7 +112,7 @@ def test_group_list_when_empty(db_path: Path) -> None:
 def test_output_uses_only_ascii(db_path: Path) -> None:
     create_flat(db_path)
 
-    result = run(db_path, "group", "list")
+    result = invoke(db_path, "group", "list")
 
     assert result.output.isascii()
 
@@ -133,7 +126,7 @@ def test_group_show(db_path: Path) -> None:
         service.add_expense("Flat", "Rent", "1000", "Alice")
         service.add_expense("Flat", "Fondue", "96", "Bob", currency="CHF", rate="1.06")
 
-    result = run(db_path, "group", "show", "flat")
+    result = invoke(db_path, "group", "show", "flat")
 
     assert result.exit_code == 0
     assert "Flat (EUR)" in result.output
@@ -143,7 +136,7 @@ def test_group_show(db_path: Path) -> None:
 
 
 def test_group_show_missing_group_is_an_error(db_path: Path) -> None:
-    result = run(db_path, "group", "show", "Nowhere")
+    result = invoke(db_path, "group", "show", "Nowhere")
 
     assert result.exit_code == 1
     assert "Error: Group 'Nowhere' not found" in result.stderr
@@ -155,7 +148,7 @@ def test_group_show_missing_group_is_an_error(db_path: Path) -> None:
 def test_group_delete_with_yes(db_path: Path) -> None:
     create_flat(db_path)
 
-    result = run(db_path, "group", "delete", "flat", "--yes")
+    result = invoke(db_path, "group", "delete", "flat", "--yes")
 
     assert result.exit_code == 0
     assert "Deleted group Flat." in result.output
@@ -165,7 +158,7 @@ def test_group_delete_with_yes(db_path: Path) -> None:
 def test_group_delete_asks_for_confirmation(db_path: Path) -> None:
     create_flat(db_path)
 
-    result = run(db_path, "group", "delete", "Flat", input="y\n")
+    result = invoke(db_path, "group", "delete", "Flat", input="y\n")
 
     assert result.exit_code == 0
     assert "Delete group 'Flat' with all of its expenses and payments?" in result.output
@@ -175,14 +168,14 @@ def test_group_delete_asks_for_confirmation(db_path: Path) -> None:
 def test_group_delete_declined_keeps_group(db_path: Path) -> None:
     create_flat(db_path)
 
-    result = run(db_path, "group", "delete", "Flat", input="n\n")
+    result = invoke(db_path, "group", "delete", "Flat", input="n\n")
 
     assert result.exit_code == 1
     assert stored_groups(db_path) == ["Flat"]
 
 
 def test_group_delete_missing_group_is_an_error(db_path: Path) -> None:
-    result = run(db_path, "group", "delete", "Nowhere", "--yes")
+    result = invoke(db_path, "group", "delete", "Nowhere", "--yes")
 
     assert result.exit_code == 1
     assert "Group 'Nowhere' not found" in result.stderr
@@ -194,7 +187,7 @@ def test_group_delete_missing_group_is_an_error(db_path: Path) -> None:
 def test_member_add(db_path: Path) -> None:
     create_flat(db_path)
 
-    result = run(db_path, "member", "add", "flat", "Carol", "Dave")
+    result = invoke(db_path, "member", "add", "flat", "Carol", "Dave")
 
     assert result.exit_code == 0
     assert "Added Carol, Dave to Flat." in result.output
@@ -204,7 +197,7 @@ def test_member_add(db_path: Path) -> None:
 def test_member_add_duplicate_is_an_error(db_path: Path) -> None:
     create_flat(db_path)
 
-    result = run(db_path, "member", "add", "Flat", "Carol", "alice")
+    result = invoke(db_path, "member", "add", "Flat", "Carol", "alice")
 
     assert result.exit_code == 1
     assert "'Alice' already exists" in result.stderr
@@ -214,7 +207,7 @@ def test_member_add_duplicate_is_an_error(db_path: Path) -> None:
 def test_member_remove(db_path: Path) -> None:
     create_flat(db_path)
 
-    result = run(db_path, "member", "remove", "flat", "BOB")
+    result = invoke(db_path, "member", "remove", "flat", "BOB")
 
     assert result.exit_code == 0
     assert "Removed Bob from Flat." in result.output
@@ -226,7 +219,7 @@ def test_member_remove_with_balance_is_an_error(db_path: Path) -> None:
     with GroupService(SQLiteRepository(db_path)) as service:
         service.add_expense("Flat", "Pizza", "20", "Alice")
 
-    result = run(db_path, "member", "remove", "Flat", "Bob")
+    result = invoke(db_path, "member", "remove", "Flat", "Bob")
 
     assert result.exit_code == 1
     assert "Cannot remove 'Bob'" in result.stderr
@@ -235,7 +228,7 @@ def test_member_remove_with_balance_is_an_error(db_path: Path) -> None:
 def test_member_remove_unknown_member_is_an_error(db_path: Path) -> None:
     create_flat(db_path)
 
-    result = run(db_path, "member", "remove", "Flat", "Zed")
+    result = invoke(db_path, "member", "remove", "Flat", "Zed")
 
     assert result.exit_code == 1
     assert "Member 'Zed' not found" in result.stderr
@@ -245,9 +238,7 @@ def test_member_remove_unknown_member_is_an_error(db_path: Path) -> None:
 
 
 def test_db_can_come_from_environment_variable(db_path: Path) -> None:
-    result = runner.invoke(
-        app, ["group", "create", "Flat"], env={DB_ENV_VAR: str(db_path)}
-    )
+    result = invoke(None, "group", "create", "Flat", env={DB_ENV_VAR: str(db_path)})
 
     assert result.exit_code == 0
     assert stored_groups(db_path) == ["Flat"]
@@ -256,7 +247,7 @@ def test_db_can_come_from_environment_variable(db_path: Path) -> None:
 def test_version_does_not_create_a_database(tmp_path: Path) -> None:
     db_path = tmp_path / "never.db"
 
-    result = runner.invoke(app, ["--db", str(db_path), "version"])
+    result = invoke(db_path, "version")
 
     assert result.exit_code == 0
     assert not db_path.exists()

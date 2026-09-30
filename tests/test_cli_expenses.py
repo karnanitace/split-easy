@@ -2,34 +2,25 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from typer.testing import CliRunner, Result
 
-from spliteasy.cli.app import app
 from spliteasy.cli.expense_cmds import balance_markup
 from spliteasy.services import GroupService
 from spliteasy.storage import SQLiteRepository
-
-runner = CliRunner()
+from tests.conftest import invoke
 
 
 @pytest.fixture
 def db_path(tmp_path: Path) -> Path:
     path = tmp_path / "cli.db"
-    result = runner.invoke(
-        app,
-        ["--db", str(path), "group", "create", "Flat"]
-        + ["-m", "Alice", "-m", "Bob", "-m", "Carol"],
+    result = invoke(
+        path, "group", "create", "Flat", "-m", "Alice", "-m", "Bob", "-m", "Carol"
     )
     assert result.exit_code == 0, result.output
     return path
 
 
-def run(db_path: Path, *args: str, input: str | None = None) -> Result:
-    return runner.invoke(app, ["--db", str(db_path), *args], input=input)
-
-
 def ok(db_path: Path, *args: str) -> str:
-    result = run(db_path, *args)
+    result = invoke(db_path, *args)
     assert result.exit_code == 0, result.output
     return result.output
 
@@ -157,7 +148,7 @@ def test_expense_add_foreign_currency_shows_conversion(db_path: Path) -> None:
 def test_expense_add_errors_exit_with_code_1(
     db_path: Path, args: list[str], message: str
 ) -> None:
-    result = run(
+    result = invoke(
         db_path, "expense", "add", "Flat", "Dinner", "30", "-p", "Alice", *args
     )
 
@@ -169,14 +160,14 @@ def test_expense_add_errors_exit_with_code_1(
 
 
 def test_expense_add_requires_paid_by(db_path: Path) -> None:
-    result = run(db_path, "expense", "add", "Flat", "Dinner", "30")
+    result = invoke(db_path, "expense", "add", "Flat", "Dinner", "30")
 
     assert result.exit_code == 2
     assert "--paid-by" in result.output
 
 
 def test_expense_add_rejects_bad_date(db_path: Path) -> None:
-    result = run(
+    result = invoke(
         db_path, "expense", "add", "Flat", "Dinner", "30", "-p", "Alice",
         "--date", "01.09.2026",
     )  # fmt: skip
@@ -236,7 +227,7 @@ def test_expense_list_when_empty(db_path: Path) -> None:
 
 
 def test_expense_list_unknown_member_is_an_error(expenses_db: Path) -> None:
-    result = run(expenses_db, "expense", "list", "Flat", "--member", "Dave")
+    result = invoke(expenses_db, "expense", "list", "Flat", "--member", "Dave")
 
     assert result.exit_code == 1
     assert "Member 'Dave' not found" in result.stderr
@@ -254,8 +245,8 @@ def test_expense_delete_with_yes(expenses_db: Path) -> None:
 
 
 def test_expense_delete_asks_for_confirmation(expenses_db: Path) -> None:
-    declined = run(expenses_db, "expense", "delete", "Flat", "1", input="n\n")
-    accepted = run(expenses_db, "expense", "delete", "Flat", "2", input="y\n")
+    declined = invoke(expenses_db, "expense", "delete", "Flat", "1", input="n\n")
+    accepted = invoke(expenses_db, "expense", "delete", "Flat", "2", input="y\n")
 
     assert declined.exit_code == 1
     assert "Delete expense #1 Rent (900.00 €)?" in declined.output
@@ -265,7 +256,7 @@ def test_expense_delete_asks_for_confirmation(expenses_db: Path) -> None:
 
 
 def test_expense_delete_missing_id_is_an_error(expenses_db: Path) -> None:
-    result = run(expenses_db, "expense", "delete", "Flat", "99", "--yes")
+    result = invoke(expenses_db, "expense", "delete", "Flat", "99", "--yes")
 
     assert result.exit_code == 1
     assert "Expense 99 not found" in result.stderr
@@ -321,7 +312,7 @@ def test_settle_when_nothing_is_owed(db_path: Path) -> None:
 def test_pay_errors_exit_with_code_1(
     db_path: Path, args: list[str], message: str
 ) -> None:
-    result = run(db_path, "pay", "Flat", *args)
+    result = invoke(db_path, "pay", "Flat", *args)
 
     assert result.exit_code == 1
     assert message in result.stderr
@@ -339,7 +330,7 @@ def test_pay_with_note_is_stored(db_path: Path) -> None:
 
 def test_balance_and_settle_for_missing_group(db_path: Path) -> None:
     for command in ("balance", "settle"):
-        result = run(db_path, command, "Nowhere")
+        result = invoke(db_path, command, "Nowhere")
 
         assert result.exit_code == 1
         assert "Group 'Nowhere' not found" in result.stderr
@@ -423,7 +414,7 @@ def test_expense_add_itemized_with_quantity_and_deposit(db_path: Path) -> None:
 def test_expense_add_itemized_errors(
     db_path: Path, args: list[str], message: str
 ) -> None:
-    result = run(
+    result = invoke(
         db_path, "expense", "add", "Flat", "Dinner", "30", "-p", "Alice", *args
     )
 

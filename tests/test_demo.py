@@ -3,15 +3,12 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from typer.testing import CliRunner
 
-from spliteasy.cli.app import app
 from spliteasy.demo import DEMO_GROUPS, ITALY_TRIP, create_demo_data
 from spliteasy.models import SplitMethod
 from spliteasy.services import GroupService
 from spliteasy.storage import SQLiteRepository
-
-runner = CliRunner()
+from tests.conftest import invoke
 
 
 @pytest.fixture
@@ -107,7 +104,7 @@ def test_demo_gives_the_same_balances_every_time(service: GroupService) -> None:
 
 
 def test_demo_command_prints_balances_settlement_and_hints(db_path: Path) -> None:
-    result = runner.invoke(app, ["--db", str(db_path), "demo"])
+    result = invoke(db_path, "demo")
 
     assert result.exit_code == 0, result.output
     assert "Created demo groups: Flat, Italy Trip" in result.output
@@ -119,7 +116,7 @@ def test_demo_command_prints_balances_settlement_and_hints(db_path: Path) -> Non
 
 
 def test_demo_command_settlement_matches_service(db_path: Path) -> None:
-    result = runner.invoke(app, ["--db", str(db_path), "demo"])
+    result = invoke(db_path, "demo")
 
     with GroupService(SQLiteRepository(db_path)) as service:
         transfers = service.suggest_settlement(ITALY_TRIP)
@@ -131,11 +128,11 @@ def test_demo_command_settlement_matches_service(db_path: Path) -> None:
 
 
 def test_demo_command_asks_before_replacing(db_path: Path) -> None:
-    runner.invoke(app, ["--db", str(db_path), "demo"])
+    invoke(db_path, "demo")
 
-    declined = runner.invoke(app, ["--db", str(db_path), "demo"], input="n\n")
-    accepted = runner.invoke(app, ["--db", str(db_path), "demo"], input="y\n")
-    forced = runner.invoke(app, ["--db", str(db_path), "demo", "--yes"])
+    declined = invoke(db_path, "demo", input="n\n")
+    accepted = invoke(db_path, "demo", input="y\n")
+    forced = invoke(db_path, "demo", "--yes")
 
     assert declined.exit_code == 1
     assert "Replace the existing groups Flat, Italy Trip" in declined.output
@@ -148,7 +145,7 @@ def test_demo_command_does_not_ask_when_groups_are_new(db_path: Path) -> None:
     with GroupService(SQLiteRepository(db_path)) as service:
         service.create_group("Unrelated")
 
-    result = runner.invoke(app, ["--db", str(db_path), "demo"])
+    result = invoke(db_path, "demo")
 
     assert result.exit_code == 0
     assert "Replace" not in result.output
