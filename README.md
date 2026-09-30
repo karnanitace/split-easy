@@ -11,6 +11,7 @@ All money is handled as `Decimal`, and every split adds up to the exact cent.
 ## Contents
 
 - [Features](#features)
+- [Use cases](#use-cases)
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Example charts](#example-charts)
@@ -47,6 +48,42 @@ All money is handled as `Decimal`, and every split adds up to the exact cent.
 - **Local storage**: everything is saved in a single SQLite file.
 - **Library API**: every feature of the CLI is available from Python through
   `GroupService`.
+
+## Use cases
+
+The diagram shows what a user can do with SplitEasy, grouped by area.
+
+```mermaid
+flowchart LR
+    User(("User"))
+
+    subgraph Groups
+        G1(["Create group"])
+        G2(["Add or remove members"])
+    end
+
+    subgraph Expenses
+        E1(["Add expense<br/>(equal, exact, percentage,<br/>shares or itemised split)"])
+        E2(["Add foreign currency expense"])
+        E3(["List and delete expenses"])
+    end
+
+    subgraph Settling["Settling up"]
+        S1(["View balances"])
+        S2(["Get suggested settlement"])
+        S3(["Record payment"])
+    end
+
+    subgraph Reports
+        R1(["Save charts"])
+        R2(["Create demo data"])
+    end
+
+    User --> Groups
+    User --> Expenses
+    User --> Settling
+    User --> Reports
+```
 
 ## Installation
 
@@ -85,6 +122,18 @@ SPLITEASY_DB=trip.db uv run -m spliteasy group list
 ```
 
 ## Quick start
+
+A typical workflow, with the command for each step:
+
+```mermaid
+flowchart LR
+    A["Create group<br/>(group create)"] --> B["Add members<br/>(member add)"]
+    B --> C["Add expenses<br/>(expense add)"]
+    C --> D["Check balances<br/>(balance)"]
+    D --> E["Settle up<br/>(settle)"]
+    E --> F["Record payments<br/>(pay)"]
+    F --> D
+```
 
 Create the demo groups: a flat shared by John and Steve, and a trip to Italy
 with John, Steve, Clark and Dan.
