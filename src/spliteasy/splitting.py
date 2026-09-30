@@ -28,12 +28,21 @@ result is rounded only once against the receipt total.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from decimal import Decimal
 from typing import ClassVar
 
 from spliteasy.exceptions import InvalidAmountError, SplitError
-from spliteasy.models import Expense, Group, Share, SplitMethod
+from spliteasy.models import (
+    Adjustment,
+    DistributionMode,
+    Expense,
+    Group,
+    LineItem,
+    Share,
+    SplitMethod,
+)
 from spliteasy.money import distribute_remainder, to_money
 
 _REGISTRY: dict[SplitMethod, "SplitStrategy"] = {}
@@ -365,17 +374,107 @@ class ExactSplit(SplitStrategy):
 
         amount_sum = sum(amounts.values(), Decimal(0))
         if amount_sum != total:
-            # Compared by size so that a refund whose parts are too small is
-            # also reported as "missing".
-            direction = "missing" if abs(amount_sum) < abs(total) else "exceeding"
-            shown_sum, shown_total, shown_difference = _same_places(
-                amount_sum, total, abs(total - amount_sum)
-            )
-            raise SplitError(
-                f"Exact amounts sum to {shown_sum} but the total is {shown_total} "
-                f"({direction} {shown_difference})"
-            )
+            raise _sum_mismatch("Exact amounts", amount_sum, total)
         return amounts
+
+
+class ItemizedSplit(SplitStrategy):
+    """Splits a receipt item by item and then spreads receipt adjustments.
+
+    Each line item is divided among its own assignees with the registered
+    strategy for the item's split method, so one receipt can mix equal,
+    exact, percentage and shares items. Items may have a negative total, such
+    as a returned bottle deposit. The unrounded parts are added up per
+    member; the result is rounded only once, by :func:`compute_shares`.
+
+    Receipt-level adjustments (discounts, fees, deposits) are then spread:
+
+    * ``PROPORTIONAL``: in proportion to each member's item subtotal, so
+      someone who bought more gets more of a discount.
+    * ``EQUAL``: in equal parts among the members who have any item.
+
+    Unlike the other strategies, an itemised split needs the receipt rather
+    than one value per member, so it is used through :meth:`raw_split_receipt`
+    and :meth:`raw_breakdown`; :meth:`raw_split` is not supported.
+    """
+
+    method = SplitMethod.ITEMIZED
+
+    def raw_split(
+        self, total: Decimal, values: Mapping[str, Decimal]
+    ) -> dict[str, Decimal]:
+        """Not supported: an itemised split needs line items.
+
+        Raises:
+            SplitError: Always; use :meth:`raw_split_receipt` instead.
+        """
+        raise SplitError(
+            "An itemized split needs line items; use raw_split_receipt() instead"
+        )
+
+    def raw_split_receipt(
+        self, items: Sequence[LineItem], adjustments: Sequence[Adjustment] = ()
+    ) -> dict[str, Decimal]:
+        """Returns each member's unrounded part of a receipt.
+
+        Args:
+            items: The receipt's line items.
+            adjustments: Receipt-level discounts, fees and deposits.
+
+        Returns:
+            The unrounded amount for each member, in the order members first
+            appear on the receipt. The amounts sum to the item totals plus the
+            signed adjustments.
+
+        Raises:
+            SplitError: If there are no items, an item cannot be split, or an
+                adjustment cannot be spread.
+        """
+        result: dict[str, Decimal] = {}
+        for _, parts in self.raw_breakdown(items, adjustments):
+            for member, amount in parts.items():
+                result[member] = result.get(member, Decimal(0)) + amount
+        return result
+
+    def raw_breakdown(
+        self, items: Sequence[LineItem], adjustments: Sequence[Adjustment] = ()
+    ) -> list[tuple[str, dict[str, Decimal]]]:
+        """Returns the unrounded parts of every item and adjustment.
+
+        This is the itemised split row by row, for showing where each
+        member's share comes from.
+
+        Args:
+            items: The receipt's line items.
+            adjustments: Receipt-level discounts, fees and deposits.
+
+        Returns:
+            One ``(label, parts)`` row per item, then one per adjustment,
+            where ``parts`` maps members to their unrounded amount.
+
+        Raises:
+            SplitError: If there are no items, an item cannot be split, or an
+                adjustment cannot be spread.
+        """
+        if not items:
+            raise SplitError("An itemized split needs at least one item")
+
+        rows: list[tuple[str, dict[str, Decimal]]] = []
+        subtotals: dict[str, Decimal] = {}
+        for item in items:
+            try:
+                parts = get_strategy(item.split_method).raw_split(
+                    item.total, item.assignees
+                )
+            except SplitError as err:
+                raise SplitError(f"Item {item.name!r}: {err}") from err
+            rows.append((_item_label(item), parts))
+            for member, amount in parts.items():
+                subtotals[member] = subtotals.get(member, Decimal(0)) + amount
+
+        for adjustment in adjustments:
+            rows.append((_adjustment_label(adjustment), _spread(adjustment, subtotals)))
+        return rows
 
 
 def _same_places(*numbers: Decimal) -> list[Decimal]:
@@ -395,10 +494,81 @@ def _same_places(*numbers: Decimal) -> list[Decimal]:
     return [number.quantize(unit) for number in numbers]
 
 
+def _sum_mismatch(what: str, actual: Decimal, total: Decimal) -> SplitError:
+    """Builds the error for parts that do not add up to a total.
+
+    Args:
+        what: What was summed, used at the start of the message, for example
+            ``"Exact amounts"``.
+        actual: The sum of the parts.
+        total: The total they should add up to.
+
+    Returns:
+        A ``SplitError`` saying how much is missing or exceeding, for example
+        ``"Exact amounts sum to 115.00 but the total is 120.00 (missing 5.00)"``.
+    """
+    # Compared by size so that a refund whose parts are too small is also
+    # reported as "missing".
+    direction = "missing" if abs(actual) < abs(total) else "exceeding"
+    shown_actual, shown_total, shown_difference = _same_places(
+        actual, total, abs(total - actual)
+    )
+    return SplitError(
+        f"{what} sum to {shown_actual} but the total is {shown_total} "
+        f"({direction} {shown_difference})"
+    )
+
+
+def _item_label(item: LineItem) -> str:
+    """Returns the display label of a line item, such as ``"Beer x6"``."""
+    return item.name if item.quantity == 1 else f"{item.name} x{item.quantity}"
+
+
+def _adjustment_label(adjustment: Adjustment) -> str:
+    """Returns the display label of an adjustment: its description or kind."""
+    return adjustment.description or adjustment.kind.value.capitalize()
+
+
+def _spread(
+    adjustment: Adjustment, subtotals: Mapping[str, Decimal]
+) -> dict[str, Decimal]:
+    """Spreads a receipt adjustment over the members of a receipt.
+
+    Args:
+        adjustment: The discount, fee or deposit.
+        subtotals: Each member's unrounded item subtotal, before adjustments.
+
+    Returns:
+        Each member's unrounded part of the signed adjustment amount.
+
+    Raises:
+        SplitError: If there is nobody to spread the adjustment over, or the
+            items total zero for a proportional adjustment.
+    """
+    amount = adjustment.signed_amount
+    label = _adjustment_label(adjustment)
+    if adjustment.distribute is DistributionMode.PROPORTIONAL:
+        base = sum(subtotals.values(), Decimal(0))
+        if base == 0:
+            raise SplitError(
+                f"Cannot spread {label!r} proportionally because the items total zero"
+            )
+        return {
+            member: amount * subtotal / base for member, subtotal in subtotals.items()
+        }
+
+    members = [member for member, subtotal in subtotals.items() if subtotal != 0]
+    if not members:
+        raise SplitError(f"Cannot spread {label!r}: nobody has an item")
+    part = amount / len(members)
+    return dict.fromkeys(members, part)
+
+
 register_strategy(EqualSplit())
 register_strategy(SharesSplit())
 register_strategy(PercentageSplit())
 register_strategy(ExactSplit())
+register_strategy(ItemizedSplit())
 
 
 def compute_shares(expense: Expense, group: Group) -> list[Share]:
@@ -436,8 +606,9 @@ def compute_shares(expense: Expense, group: Group) -> list[Share]:
 
     Raises:
         SplitError: If the group has no members, the split values are not
-            valid for the split method, or the expense is itemised (not
-            supported yet).
+            valid for the split method, the items and adjustments of an
+            itemised expense do not add up to its amount, or a member's share
+            would be negative.
         MemberNotFoundError: If the payer or any other name used in the
             expense is not a member of the group.
     """
@@ -446,12 +617,21 @@ def compute_shares(expense: Expense, group: Group) -> list[Share]:
     for name in expense.involved_members:
         group.resolve_name(name)
 
-    values = _strategy_values(expense, group)
-    strategy = get_strategy(expense.split_method)
-    raw = strategy.raw_split(expense.amount, values)
+    if expense.split_method is SplitMethod.ITEMIZED:
+        raw = _raw_itemized(expense, group)
+    else:
+        values = _strategy_values(expense, group)
+        raw = get_strategy(expense.split_method).raw_split(expense.amount, values)
     raw_base = {member: amount * expense.rate_to_base for member, amount in raw.items()}
     total_base = expense.base_amount(group.currency)
     amounts = distribute_remainder(raw_base, total_base, group.currency)
+
+    negative = [member for member, amount in amounts.items() if amount < 0]
+    if negative:
+        raise SplitError(
+            f"{negative[0]}'s share would be negative ({amounts[negative[0]]}); "
+            "give the refund items to members who also have other items"
+        )
     return [Share(member, amount) for member, amount in amounts.items()]
 
 
@@ -476,6 +656,55 @@ def apply_split(expense: Expense, group: Group) -> Expense:
     return expense
 
 
+def resolve_items(items: Iterable[LineItem], group: Group) -> list[LineItem]:
+    """Returns line items whose assignees use the group's stored names.
+
+    Args:
+        items: The line items.
+        group: The group used to resolve member names.
+
+    Returns:
+        New line items with the same data, where every assignee name has the
+        spelling stored in the group (``"alice"`` becomes ``"Alice"``).
+
+    Raises:
+        MemberNotFoundError: If an assignee is not a member of the group.
+    """
+    return [
+        replace(
+            item,
+            assignees={
+                group.resolve_name(name): weight
+                for name, weight in item.assignees.items()
+            },
+        )
+        for item in items
+    ]
+
+
+def _raw_itemized(expense: Expense, group: Group) -> dict[str, Decimal]:
+    """Returns the unrounded parts of an itemised expense in its currency.
+
+    Args:
+        expense: An itemised expense.
+        group: The group used to resolve member names.
+
+    Returns:
+        Each member's unrounded part, keyed by stored name.
+
+    Raises:
+        SplitError: If the items and adjustments do not add up to the
+            expense amount, or the receipt cannot be split.
+        MemberNotFoundError: If an assignee is not a member of the group.
+    """
+    if expense.items_total != expense.amount:
+        raise _sum_mismatch(
+            "Items and adjustments", expense.items_total, expense.amount
+        )
+    items = resolve_items(expense.items, group)
+    return ItemizedSplit().raw_split_receipt(items, expense.adjustments)
+
+
 def _strategy_values(expense: Expense, group: Group) -> dict[str, Decimal]:
     """Builds the strategy input for an expense, using stored member names.
 
@@ -487,13 +716,11 @@ def _strategy_values(expense: Expense, group: Group) -> dict[str, Decimal]:
         The value for each member, keyed by the member's stored name.
 
     Raises:
-        SplitError: If the expense is itemised, or an exact amount is not a
-            valid amount in the expense currency.
+        SplitError: If an exact amount is not a valid amount in the expense
+            currency.
         MemberNotFoundError: If a name is not a member of the group.
     """
     method = expense.split_method
-    if method is SplitMethod.ITEMIZED:
-        raise SplitError("Itemized splits are not supported yet")
     if method is SplitMethod.EQUAL:
         names = expense.participants or group.member_names
         return {group.resolve_name(name): Decimal(1) for name in names}

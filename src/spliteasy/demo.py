@@ -5,7 +5,8 @@ the :class:`~spliteasy.services.GroupService`, so every expense is validated
 and split exactly as if a user had entered it:
 
 * **Flat**: two flatmates with rent (exact split), internet (equal), several
-  grocery trips and one payment already made.
+  grocery trips including an itemised Kaufland receipt with a discount, and
+  one payment already made.
 * **Italy Trip**: four friends with twelve expenses in food, transport,
   accommodation and entertainment, using all four split methods and two
   expenses in Swiss francs converted at a fixed rate.
@@ -14,8 +15,9 @@ All dates are fixed, so the demo gives the same balances every time.
 """
 
 from datetime import date
+from decimal import Decimal
 
-from spliteasy.models import SplitMethod
+from spliteasy.models import Adjustment, AdjustmentKind, LineItem, SplitMethod
 from spliteasy.services import GroupService
 
 FLAT = "Flat"
@@ -79,6 +81,35 @@ def _create_flat(service: GroupService) -> None:
         service.add_expense(
             FLAT, f"Groceries {shop}", amount, payer, category="groceries", date=day
         )
+
+    # Each item is shared only by the people who use it. The deposit for
+    # Steve's returned bottles lowers his part, and the coupon is spread in
+    # proportion to what each person bought.
+    service.add_expense(
+        FLAT,
+        "Kaufland",
+        "17.00",
+        "Steve",
+        split=SplitMethod.ITEMIZED,
+        items=[
+            LineItem.for_members("Olive oil", "6.00", ["John", "Steve"]),
+            LineItem.for_members("Protein bars", "2.50", ["John"], quantity=2),
+            LineItem.for_members("Yogurt", "4.00", ["John"]),
+            LineItem.for_members("Coffee", "5.00", ["Steve"]),
+            LineItem.for_members(
+                "Bottle deposit return", "-0.25", ["Steve"], quantity=4
+            ),
+        ],
+        adjustments=[
+            Adjustment(
+                kind=AdjustmentKind.DISCOUNT,
+                amount=Decimal("2.00"),
+                description="Coupon",
+            )
+        ],
+        category="groceries",
+        date=date(2026, 9, 15),
+    )
 
     service.record_payment(
         FLAT,

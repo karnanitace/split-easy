@@ -50,6 +50,12 @@ def test_flat_group_contents(service: GroupService) -> None:
     rent = next(e for e in ledger.expenses if e.category == "rent")
     assert rent.split_method is SplitMethod.EXACT
     assert sum(1 for e in ledger.expenses if e.category == "groceries") >= 2
+    kaufland = next(
+        e for e in ledger.expenses if e.split_method is SplitMethod.ITEMIZED
+    )
+    assert kaufland.adjustments
+    assert any(item.price < 0 for item in kaufland.items)
+    assert sum(share.amount for share in kaufland.shares) == kaufland.amount
 
 
 def test_italy_trip_contents(service: GroupService) -> None:

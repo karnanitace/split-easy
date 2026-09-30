@@ -32,7 +32,7 @@ from spliteasy.models import (
 )
 from spliteasy.money import normalize_currency, parse_decimal, to_money
 from spliteasy.settlement import settle_greedy
-from spliteasy.splitting import apply_split
+from spliteasy.splitting import apply_split, resolve_items
 from spliteasy.storage import Repository, SQLiteRepository
 
 S = TypeVar("S", bound="GroupService")
@@ -251,7 +251,8 @@ class GroupService:
             category: The expense category.
             date: The day of the expense. Defaults to today.
             note: An optional note.
-            items: For itemised splits, the receipt's line items.
+            items: For itemised splits, the receipt's line items. Their
+                total plus the adjustments must equal ``amount``.
             adjustments: For itemised splits, receipt-level adjustments.
 
         Returns:
@@ -289,7 +290,7 @@ class GroupService:
                 group.resolve_name(name): value  # type: ignore[misc]
                 for name, value in (split_values or {}).items()
             },
-            items=list(items),
+            items=resolve_items(items, group),
             adjustments=list(adjustments),
             category=category,
             rate_to_base=rate_to_base,

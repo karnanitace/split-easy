@@ -15,7 +15,14 @@ from spliteasy.exceptions import (
     StorageError,
     ValidationError,
 )
-from spliteasy.models import Expense, LineItem, Share, SplitMethod
+from spliteasy.models import (
+    Adjustment,
+    AdjustmentKind,
+    Expense,
+    LineItem,
+    Share,
+    SplitMethod,
+)
 from spliteasy.services import GroupService
 from spliteasy.storage import SQLiteRepository
 from spliteasy.storage.sqlite import DB_ENV_VAR
@@ -236,14 +243,46 @@ def test_add_expense_with_unknown_member_saves_nothing(
     assert service.get_ledger(flat).expenses == []
 
 
-def test_itemized_expense_is_not_supported_yet(
+def test_itemized_expense_end_to_end(service: GroupService, flat: str) -> None:
+    expense = service.add_expense(
+        flat,
+        "Kaufland",
+        "18.00",
+        "alice",
+        split="itemized",
+        items=[
+            LineItem.for_members("Olive oil", "6.00", ["alice", "BOB"]),
+            LineItem.for_members("Protein bars", "5.00", ["Alice"]),
+            LineItem.for_members("Yogurt", "4.00", ["ALICE"]),
+            LineItem.for_members("Coffee", "5.00", ["bob"]),
+        ],
+        adjustments=[Adjustment(kind=AdjustmentKind.DISCOUNT, amount=Decimal(2))],
+        category="groceries",
+    )
+
+    assert expense.shares == [
+        Share("Alice", Decimal("10.80")),
+        Share("Bob", Decimal("7.20")),
+    ]
+    assert list(expense.items[0].assignees) == ["Alice", "Bob"]
+
+    stored = service.get_ledger(flat).get_expense(expense.id)  # type: ignore[arg-type]
+    assert stored == expense
+    assert service.balances(flat) == {
+        "Alice": Decimal("7.20"),
+        "Bob": Decimal("-7.20"),
+        "Carol": Decimal("0.00"),
+    }
+
+
+def test_itemized_expense_with_wrong_total_saves_nothing(
     service: GroupService, flat: str
 ) -> None:
-    with pytest.raises(SplitError, match="not supported yet"):
+    with pytest.raises(SplitError, match="missing 1.00"):
         service.add_expense(
             flat,
             "Kaufland",
-            "6.00",
+            "7.00",
             "Alice",
             split="itemized",
             items=[LineItem.for_members("Oil", "6.00", ["Alice", "Bob"])],

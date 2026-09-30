@@ -16,10 +16,12 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from spliteasy.cli.parsing import parse_values
-from spliteasy.models import Expense
+from spliteasy.cli.parsing import ITEM_FORMAT, parse_item, parse_values
+from spliteasy.exceptions import ValidationError
+from spliteasy.models import Adjustment, AdjustmentKind, Expense, SplitMethod
 from spliteasy.money import format_money
 from spliteasy.services import GroupService
+from spliteasy.splitting import ItemizedSplit
 
 console = Console()
 
@@ -99,15 +101,46 @@ def add_expense(
         typer.Option("--date", formats=DATE_FORMATS, help="Date as YYYY-MM-DD."),
     ] = None,
     note: Annotated[str, typer.Option("--note", help="Optional note.")] = "",
+    item: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--item",
+            help=f"Receipt item as {ITEM_FORMAT}. Repeat for each item; "
+            "the split becomes itemized.",
+        ),
+    ] = None,
+    discount: Annotated[
+        str | None,
+        typer.Option(
+            "--discount",
+            help="Receipt discount, spread in proportion to each member's items.",
+        ),
+    ] = None,
 ) -> None:
     """Add an expense and show how it was split."""
+    method = split.strip().lower()
+    items = [parse_item(text) for text in item or []]
+    if items:
+        if method not in (SplitMethod.EQUAL.value, SplitMethod.ITEMIZED.value):
+            raise ValidationError(f"--item cannot be combined with --split {method}")
+        if among or values is not None:
+            raise ValidationError("--item cannot be combined with --among or --values")
+        method = SplitMethod.ITEMIZED.value
+    elif discount is not None:
+        raise ValidationError("--discount can only be used together with --item")
+    adjustments = (
+        [Adjustment(kind=AdjustmentKind.DISCOUNT, amount=discount)]  # type: ignore[arg-type]
+        if discount is not None
+        else []
+    )
+
     service = _service(ctx)
     expense = service.add_expense(
         group,
         description,
         amount,
         paid_by,
-        split=split.strip().lower(),
+        split=method,
         participants=among or [],
         split_values=parse_values(values) if values is not None else None,
         currency=currency,
@@ -115,6 +148,8 @@ def add_expense(
         category=category,
         date=date.date() if date is not None else None,
         note=note,
+        items=items,
+        adjustments=adjustments,
     )
     group_currency = service.get_ledger(group).group.currency
     _print_added_expense(expense, group_currency)
@@ -131,12 +166,54 @@ def _print_added_expense(expense: Expense, group_currency: str) -> None:
         f"({paid}, paid by {escape(expense.payer)})"
     )
 
+    if expense.split_method is SplitMethod.ITEMIZED:
+        console.print(itemized_breakdown_table(expense, group_currency))
+        return
+
     table = Table(title="Shares", box=box.ASCII)
     table.add_column("Member")
     table.add_column("Share", justify="right")
     for share in expense.shares:
         table.add_row(escape(share.member), format_money(share.amount, group_currency))
     console.print(table)
+
+
+def itemized_breakdown_table(expense: Expense, group_currency: str) -> Table:
+    """Builds a table of an itemised expense: items as rows, members as columns.
+
+    Item and adjustment cells are each member's part, rounded for display in
+    the expense currency. The bottom row shows the actual shares, which are
+    rounded only once for the whole receipt, so a column can differ from the
+    sum of its cells by a cent.
+
+    Args:
+        expense: An itemised expense with computed shares.
+        group_currency: The currency of the shares.
+
+    Returns:
+        The table, ready to print.
+    """
+    members = [share.member for share in expense.shares]
+    rows = ItemizedSplit().raw_breakdown(expense.items, expense.adjustments)
+
+    table = Table(title="Breakdown", box=box.ASCII, show_footer=True)
+    total_label = (
+        "Total" if expense.currency == group_currency else f"Total ({group_currency})"
+    )
+    table.add_column("Item", footer=total_label)
+    for member in members:
+        table.add_column(
+            escape(member),
+            justify="right",
+            footer=format_money(expense.share_of(member), group_currency),
+        )
+    for label, parts in rows:
+        cells = [
+            format_money(parts[member], expense.currency) if parts.get(member) else "-"
+            for member in members
+        ]
+        table.add_row(escape(label), *cells)
+    return table
 
 
 @expense_app.command("list")

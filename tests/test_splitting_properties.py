@@ -5,7 +5,15 @@ from decimal import Decimal
 from hypothesis import given
 from hypothesis import strategies as st
 
-from spliteasy.models import Expense, Group, Member, SplitMethod
+from spliteasy.models import (
+    Adjustment,
+    AdjustmentKind,
+    Expense,
+    Group,
+    LineItem,
+    Member,
+    SplitMethod,
+)
 from spliteasy.money import minor_unit, to_money
 from spliteasy.splitting import compute_shares, get_strategy
 
@@ -257,3 +265,58 @@ def build_expense(
             split_values=values,
         )
     return group, expense
+
+
+@st.composite
+def receipts(draw: st.DrawFn) -> tuple[list[LineItem], list[Adjustment]]:
+    """Draws 1 to 8 equal-split items and an optional proportional discount."""
+    items = []
+    for index in range(draw(st.integers(min_value=1, max_value=8))):
+        items.append(
+            LineItem.for_members(
+                f"Item {index}",
+                from_cents(draw(st.integers(min_value=1, max_value=100_000))),
+                draw(member_lists),
+                quantity=draw(st.integers(min_value=1, max_value=5)),
+            )
+        )
+    subtotal_cents = int(sum(item.total for item in items) * 100)
+    adjustments = []
+    discount_cents = draw(st.integers(min_value=0, max_value=subtotal_cents - 1))
+    if discount_cents:
+        adjustments.append(
+            Adjustment(kind=AdjustmentKind.DISCOUNT, amount=from_cents(discount_cents))
+        )
+    return items, adjustments
+
+
+@given(receipts(), exchange_rates, st.sampled_from(["EUR", "JPY"]))
+def test_itemized_shares_sum_to_base_amount(
+    receipt: tuple[list[LineItem], list[Adjustment]],
+    rate: Decimal,
+    group_currency: str,
+) -> None:
+    """Property 3 for ITEMIZED: shares sum exactly to base_amount for any rate."""
+    items, adjustments = receipt
+    group = Group(
+        name="Trip",
+        currency=group_currency,
+        members=[Member(name) for name in NAMES],
+    )
+    total = sum(item.total for item in items) + sum(
+        adjustment.signed_amount for adjustment in adjustments
+    )
+    expense = Expense(
+        description="Receipt",
+        amount=total,
+        payer=NAMES[0],
+        rate_to_base=rate,
+        split_method=SplitMethod.ITEMIZED,
+        items=items,
+        adjustments=adjustments,
+    )
+
+    shares = compute_shares(expense, group)
+
+    assert sum(share.amount for share in shares) == expense.base_amount(group.currency)
+    assert all(share.amount >= 0 for share in shares)

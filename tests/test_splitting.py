@@ -5,10 +5,21 @@ import pytest
 
 from spliteasy import splitting
 from spliteasy.exceptions import AllocationError, MemberNotFoundError, SplitError
-from spliteasy.models import Expense, Group, LineItem, Member, Share, SplitMethod
+from spliteasy.models import (
+    Adjustment,
+    AdjustmentKind,
+    DistributionMode,
+    Expense,
+    Group,
+    LineItem,
+    Member,
+    Share,
+    SplitMethod,
+)
 from spliteasy.splitting import (
     EqualSplit,
     ExactSplit,
+    ItemizedSplit,
     PercentageSplit,
     SharesSplit,
     SplitStrategy,
@@ -16,6 +27,7 @@ from spliteasy.splitting import (
     compute_shares,
     get_strategy,
     register_strategy,
+    resolve_items,
 )
 
 
@@ -845,14 +857,16 @@ def test_group_without_members_raises_split_error() -> None:
         compute_shares(make_expense(), Group(name="Empty"))
 
 
-def test_itemized_split_is_not_supported_yet(flat: Group) -> None:
+def test_itemized_split_end_to_end(flat: Group) -> None:
     expense = make_expense(
         split_method="itemized",
         items=[LineItem.for_members("Pizza", "120.00", ["Alice", "Bob"])],
     )
 
-    with pytest.raises(SplitError, match="Itemized splits are not supported yet"):
-        compute_shares(expense, flat)
+    assert as_dict(compute_shares(expense, flat)) == {
+        "Alice": Decimal("60.00"),
+        "Bob": Decimal("60.00"),
+    }
 
 
 def test_compute_shares_does_not_modify_expense(flat: Group) -> None:
@@ -885,3 +899,290 @@ def test_apply_split_replaces_existing_shares(flat: Group) -> None:
     apply_split(expense, flat)
 
     assert expense.shares == [Share("Carol", Decimal("9.00"))]
+
+
+# ItemizedSplit
+
+
+def kaufland_items() -> list[LineItem]:
+    return [
+        LineItem.for_members("Olive oil", "6.00", ["Alice", "Bob"]),
+        LineItem.for_members("Protein bars", "5.00", ["Alice"]),
+        LineItem.for_members("Yogurt", "4.00", ["Alice"]),
+        LineItem.for_members("Coffee", "5.00", ["Bob"]),
+    ]
+
+
+def itemized(amount: str, items: list[LineItem], **fields: object) -> Expense:
+    return make_expense(amount=amount, split_method="itemized", items=items, **fields)
+
+
+def test_kaufland_example(flat: Group) -> None:
+    shares = compute_shares(itemized("20.00", kaufland_items()), flat)
+
+    assert shares == [Share("Alice", Decimal("12.00")), Share("Bob", Decimal("8.00"))]
+
+
+def test_kaufland_raw_breakdown() -> None:
+    rows = ItemizedSplit().raw_breakdown(kaufland_items())
+
+    assert rows == [
+        ("Olive oil", {"Alice": Decimal("3.00"), "Bob": Decimal("3.00")}),
+        ("Protein bars", {"Alice": Decimal("5.00")}),
+        ("Yogurt", {"Alice": Decimal("4.00")}),
+        ("Coffee", {"Bob": Decimal("5.00")}),
+    ]
+
+
+def test_proportional_discount(flat: Group) -> None:
+    discount = Adjustment(kind=AdjustmentKind.DISCOUNT, amount=Decimal("2.00"))
+
+    shares = compute_shares(
+        itemized("18.00", kaufland_items(), adjustments=[discount]), flat
+    )
+
+    # Alice bought 12.00 of 20.00, so she gets 60% of the discount.
+    assert as_dict(shares) == {"Alice": Decimal("10.80"), "Bob": Decimal("7.20")}
+
+
+def test_proportional_discount_needing_rounding(flat: Group) -> None:
+    items = [
+        LineItem.for_members("Bread", "3.00", ["Alice"]),
+        LineItem.for_members("Cheese", "4.00", ["Bob"]),
+        LineItem.for_members("Wine", "3.00", ["Carol"]),
+    ]
+    discount = Adjustment(kind=AdjustmentKind.DISCOUNT, amount=Decimal("1.00"))
+
+    shares = compute_shares(itemized("9.00", items, adjustments=[discount]), flat)
+
+    assert sum(share.amount for share in shares) == Decimal("9.00")
+    assert as_dict(shares) == {
+        "Alice": Decimal("2.70"),
+        "Bob": Decimal("3.60"),
+        "Carol": Decimal("2.70"),
+    }
+
+
+def test_equal_fee_is_spread_among_members_with_items(flat: Group) -> None:
+    fee = Adjustment(
+        kind=AdjustmentKind.FEE,
+        amount=Decimal("3.00"),
+        distribute=DistributionMode.EQUAL,
+        description="Delivery",
+    )
+
+    shares = compute_shares(
+        itemized("23.00", kaufland_items(), adjustments=[fee]), flat
+    )
+
+    # Carol has no item, so the fee is shared by Alice and Bob only.
+    assert as_dict(shares) == {"Alice": Decimal("13.50"), "Bob": Decimal("9.50")}
+
+
+def test_several_adjustments_use_item_subtotals(flat: Group) -> None:
+    adjustments = [
+        Adjustment(kind=AdjustmentKind.DISCOUNT, amount=Decimal("2.00")),
+        Adjustment(kind=AdjustmentKind.DEPOSIT, amount=Decimal("1.00")),
+    ]
+
+    shares = compute_shares(
+        itemized("19.00", kaufland_items(), adjustments=adjustments), flat
+    )
+
+    assert as_dict(shares) == {"Alice": Decimal("11.40"), "Bob": Decimal("7.60")}
+
+
+def test_deposit_return_item_with_negative_price(flat: Group) -> None:
+    items = [
+        LineItem.for_members("Water", "0.49", ["Alice"], quantity=6),
+        LineItem.for_members("Deposit return", "-0.25", ["Alice"], quantity=6),
+        LineItem.for_members("Coffee", "5.00", ["Bob"]),
+    ]
+
+    shares = compute_shares(itemized("6.44", items), flat)
+
+    assert as_dict(shares) == {"Alice": Decimal("1.44"), "Bob": Decimal("5.00")}
+
+
+def test_shared_deposit_return_uses_equal_split_of_negative_total(
+    flat: Group,
+) -> None:
+    items = [
+        LineItem.for_members("Beer crate", "15.00", ["Alice", "Bob", "Carol"]),
+        LineItem.for_members(
+            "Crate deposit return", "-3.10", ["Alice", "Bob", "Carol"]
+        ),
+    ]
+
+    shares = compute_shares(itemized("11.90", items), flat)
+
+    assert sum(share.amount for share in shares) == Decimal("11.90")
+    assert sorted(share.amount for share in shares) == [
+        Decimal("3.96"),
+        Decimal("3.97"),
+        Decimal("3.97"),
+    ]
+
+
+def test_percentage_split_item(flat: Group) -> None:
+    items = [
+        LineItem(
+            name="Coffee",
+            price=Decimal("5.00"),
+            assignees={"Alice": Decimal(70), "Bob": Decimal(30)},
+            split_method=SplitMethod.PERCENTAGE,
+        ),
+        LineItem.for_members("Milk", "1.00", ["Carol"]),
+    ]
+
+    shares = compute_shares(itemized("6.00", items), flat)
+
+    assert as_dict(shares) == {
+        "Alice": Decimal("3.50"),
+        "Bob": Decimal("1.50"),
+        "Carol": Decimal("1.00"),
+    }
+
+
+def test_exact_and_shares_split_items(flat: Group) -> None:
+    items = [
+        LineItem(
+            name="Pizza",
+            price=Decimal("10.00"),
+            quantity=2,
+            assignees={"Alice": Decimal("12.00"), "Bob": Decimal("8.00")},
+            split_method=SplitMethod.EXACT,
+        ),
+        LineItem(
+            name="Wine",
+            price=Decimal("9.00"),
+            assignees={"Bob": Decimal(1), "Carol": Decimal(2)},
+            split_method=SplitMethod.SHARES,
+        ),
+    ]
+
+    shares = compute_shares(itemized("29.00", items), flat)
+
+    assert as_dict(shares) == {
+        "Alice": Decimal("12.00"),
+        "Bob": Decimal("11.00"),
+        "Carol": Decimal("6.00"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("amount", "message"),
+    [
+        (
+            "21.00",
+            "Items and adjustments sum to 20.00 but the total is 21.00 (missing 1.00)",
+        ),
+        (
+            "19.50",
+            "Items and adjustments sum to 20.00 but the total is 19.50 "
+            "(exceeding 0.50)",
+        ),
+    ],
+)
+def test_mismatched_total_raises_split_error(
+    flat: Group, amount: str, message: str
+) -> None:
+    with pytest.raises(SplitError) as excinfo:
+        compute_shares(itemized(amount, kaufland_items()), flat)
+
+    assert str(excinfo.value) == message
+
+
+def test_item_errors_name_the_item(flat: Group) -> None:
+    item = LineItem(
+        name="Coffee",
+        price=Decimal("5.00"),
+        assignees={"Alice": Decimal(60), "Bob": Decimal(30)},
+        split_method=SplitMethod.PERCENTAGE,
+    )
+
+    with pytest.raises(SplitError, match="Item 'Coffee': Percentages must sum to 100"):
+        compute_shares(itemized("5.00", [item]), flat)
+
+
+def test_itemized_names_are_resolved_and_merged(flat: Group) -> None:
+    items = [
+        LineItem.for_members("Bread", "2.00", ["alice", "BOB"]),
+        LineItem.for_members("Milk", "1.00", ["Alice"]),
+    ]
+
+    shares = compute_shares(itemized("3.00", items), flat)
+
+    assert shares == [Share("Alice", Decimal("2.00")), Share("Bob", Decimal("1.00"))]
+
+
+def test_itemized_unknown_assignee_raises(flat: Group) -> None:
+    items = [LineItem.for_members("Bread", "2.00", ["Dave"])]
+
+    with pytest.raises(MemberNotFoundError, match="'Dave'"):
+        compute_shares(itemized("2.00", items), flat)
+
+
+def test_itemized_foreign_currency_rounds_once_after_conversion(flat: Group) -> None:
+    expense = itemized("20.00", kaufland_items(), currency="CHF", rate_to_base="1.0612")
+
+    shares = compute_shares(expense, flat)
+
+    assert sum(share.amount for share in shares) == expense.base_amount("EUR")
+    assert as_dict(shares) == {"Alice": Decimal("12.73"), "Bob": Decimal("8.49")}
+
+
+def test_member_with_only_a_refund_is_rejected(flat: Group) -> None:
+    items = [
+        LineItem.for_members("Beer", "5.00", ["Alice"]),
+        LineItem.for_members("Deposit return", "-1.00", ["Bob"]),
+    ]
+
+    with pytest.raises(SplitError, match="Bob's share would be negative"):
+        compute_shares(itemized("4.00", items), flat)
+
+
+def test_proportional_adjustment_needs_non_zero_subtotal() -> None:
+    items = [
+        LineItem.for_members("Bottle", "1.00", ["Alice"]),
+        LineItem.for_members("Bottle return", "-1.00", ["Alice"]),
+    ]
+    discount = Adjustment(kind=AdjustmentKind.DISCOUNT, amount=Decimal("0.50"))
+
+    with pytest.raises(SplitError, match="items total zero"):
+        ItemizedSplit().raw_split_receipt(items, [discount])
+
+
+def test_itemized_split_needs_items() -> None:
+    with pytest.raises(SplitError, match="at least one item"):
+        ItemizedSplit().raw_split_receipt([])
+
+
+def test_itemized_strategy_is_registered_but_needs_items() -> None:
+    strategy = get_strategy("itemized")
+
+    assert isinstance(strategy, ItemizedSplit)
+    with pytest.raises(SplitError, match="needs line items"):
+        strategy.raw_split(Decimal("10.00"), {"Alice": Decimal(1)})
+
+
+def test_breakdown_labels_quantities_and_adjustments() -> None:
+    items = [LineItem.for_members("Beer", "1.10", ["Alice"], quantity=6)]
+    adjustments = [
+        Adjustment(kind=AdjustmentKind.DISCOUNT, amount=Decimal("0.60")),
+        Adjustment(kind=AdjustmentKind.FEE, amount=Decimal(1), description="Tip"),
+    ]
+
+    labels = [label for label, _ in ItemizedSplit().raw_breakdown(items, adjustments)]
+
+    assert labels == ["Beer x6", "Discount", "Tip"]
+
+
+def test_resolve_items_uses_stored_spelling(flat: Group) -> None:
+    items = [LineItem.for_members("Bread", "2.00", ["alice", "BOB"])]
+
+    resolved = resolve_items(items, flat)
+
+    assert list(resolved[0].assignees) == ["Alice", "Bob"]
+    assert resolved[0].price == Decimal("2.00")
+    assert list(items[0].assignees) == ["alice", "BOB"]

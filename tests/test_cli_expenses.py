@@ -343,3 +343,91 @@ def test_balance_and_settle_for_missing_group(db_path: Path) -> None:
 
         assert result.exit_code == 1
         assert "Group 'Nowhere' not found" in result.stderr
+
+
+# Itemized expenses
+
+
+KAUFLAND_ITEMS = [
+    "--item", "Olive oil:6.00:Alice,Bob",
+    "--item", "Protein bars:5.00:Alice",
+    "--item", "Yogurt:4.00:Alice",
+    "--item", "Coffee:5.00:Bob",
+]  # fmt: skip
+
+
+def test_expense_add_itemized_prints_breakdown(db_path: Path) -> None:
+    output = ok(
+        db_path, "expense", "add", "Flat", "Kaufland", "18", "-p", "Alice",
+        *KAUFLAND_ITEMS, "--discount", "2",
+    )  # fmt: skip
+
+    rows = {
+        cells[0]: cells[1:]
+        for line in output.splitlines()
+        if (cells := [c.strip() for c in line.strip().strip("|").split("|")])
+        and len(cells) == 3
+    }
+    assert rows["Item"] == ["Alice", "Bob"]
+    assert rows["Olive oil"] == ["3.00 €", "3.00 €"]
+    assert rows["Protein bars"] == ["5.00 €", "-"]
+    assert rows["Coffee"] == ["-", "5.00 €"]
+    assert rows["Discount"] == ["-1.20 €", "-0.80 €"]
+    assert rows["Total"] == ["10.80 €", "7.20 €"]
+    assert output.replace("€", "").isascii()
+
+    with service(db_path) as svc:
+        expense = svc.list_expenses("Flat")[0]
+    assert expense.split_method.value == "itemized"
+    assert len(expense.items) == 4
+    assert expense.adjustments[0].signed_amount == Decimal("-2")
+
+
+def test_expense_add_itemized_with_quantity_and_deposit(db_path: Path) -> None:
+    ok(
+        db_path, "expense", "add", "Flat", "Rewe", "5.40", "-p", "Bob",
+        "--item", "Water:0,49:Bob:6", "--item", "Deposit return:-0.25:Bob:6",
+        "--item", "Bread:3.96:Alice,Bob,Carol",
+    )  # fmt: skip
+
+    with service(db_path) as svc:
+        balances = svc.balances("Flat")
+    assert balances == {
+        "Alice": Decimal("-1.32"),
+        "Bob": Decimal("2.64"),
+        "Carol": Decimal("-1.32"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (
+            ["--item", "Oil:6.00:Alice"],
+            "sum to 6.00 but the total is 30.00 (missing 24.00)",
+        ),
+        (["--item", "Oil"], "Invalid item 'Oil'"),
+        (["--item", "Oil:30:Dave"], "Member 'Dave' not found"),
+        (["--discount", "2"], "--discount can only be used together with --item"),
+        (
+            ["--item", "Oil:30:Alice", "--split", "exact"],
+            "cannot be combined with --split",
+        ),
+        (
+            ["--item", "Oil:30:Alice", "--among", "Bob"],
+            "cannot be combined with --among",
+        ),
+        (["--item", "Oil:32:Alice", "--discount", "abc"], "is not a valid number"),
+    ],
+)
+def test_expense_add_itemized_errors(
+    db_path: Path, args: list[str], message: str
+) -> None:
+    result = run(
+        db_path, "expense", "add", "Flat", "Dinner", "30", "-p", "Alice", *args
+    )
+
+    assert result.exit_code == 1
+    assert message in result.stderr
+    with service(db_path) as svc:
+        assert svc.list_expenses("Flat") == []
