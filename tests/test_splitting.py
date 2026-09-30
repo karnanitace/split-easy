@@ -8,6 +8,7 @@ from spliteasy.exceptions import AllocationError, SplitError
 from spliteasy.models import SplitMethod
 from spliteasy.splitting import (
     EqualSplit,
+    SharesSplit,
     SplitStrategy,
     get_strategy,
     register_strategy,
@@ -324,3 +325,102 @@ def test_equal_split_is_registered() -> None:
     assert isinstance(strategy, EqualSplit)
     assert get_strategy(SplitMethod.EQUAL) is strategy
     assert strategy.method is SplitMethod.EQUAL
+
+
+# SharesSplit
+
+
+def test_shares_split_apartment_example() -> None:
+    result = SharesSplit().split("300.00", {"Alice": Decimal(2), "Bob": Decimal(1)})
+
+    assert result == {"Alice": Decimal("200.00"), "Bob": Decimal("100.00")}
+
+
+def test_shares_raw_split_is_proportional_and_unrounded() -> None:
+    raw = SharesSplit().raw_split(
+        Decimal("100.00"), {"Alice": Decimal(2), "Bob": Decimal(1)}
+    )
+
+    assert raw == {
+        "Alice": Decimal("100.00") * 2 / 3,
+        "Bob": Decimal("100.00") / 3,
+    }
+
+
+def test_shares_split_fractional_weights() -> None:
+    values = {"Alice": Decimal("1.5"), "Bob": Decimal("0.5"), "Carol": Decimal(2)}
+
+    result = SharesSplit().split("80.00", values)
+
+    assert result == {
+        "Alice": Decimal("30.00"),
+        "Bob": Decimal("10.00"),
+        "Carol": Decimal("40.00"),
+    }
+
+
+def test_shares_split_zero_weight_gets_nothing() -> None:
+    values = {"Alice": Decimal(1), "Bob": Decimal(0), "Carol": Decimal(3)}
+
+    result = SharesSplit().split("40.00", values)
+
+    assert result == {
+        "Alice": Decimal("10.00"),
+        "Bob": Decimal("0.00"),
+        "Carol": Decimal("30.00"),
+    }
+
+
+def test_shares_split_needs_remainder_rounding() -> None:
+    result = SharesSplit().split("10.00", ALICE_BOB_CAROL)
+
+    assert result == {
+        "Alice": Decimal("3.34"),
+        "Bob": Decimal("3.33"),
+        "Carol": Decimal("3.33"),
+    }
+
+
+def test_shares_split_gives_leftover_to_largest_remainder() -> None:
+    values = {"Alice": Decimal(1), "Bob": Decimal(2)}
+
+    assert SharesSplit().split("10.00", values) == {
+        "Alice": Decimal("3.33"),
+        "Bob": Decimal("6.67"),
+    }
+
+
+def test_shares_split_negative_total() -> None:
+    values = {"Alice": Decimal(2), "Bob": Decimal(1)}
+
+    result = SharesSplit().split("-300.00", values)
+
+    assert result == {"Alice": Decimal("-200.00"), "Bob": Decimal("-100.00")}
+
+
+def test_shares_split_jpy() -> None:
+    result = SharesSplit().split(1000, {"Alice": Decimal(1), "Bob": Decimal(2)}, "JPY")
+
+    assert result == {"Alice": Decimal("333"), "Bob": Decimal("667")}
+
+
+def test_shares_split_rejects_empty_values() -> None:
+    with pytest.raises(SplitError, match="at least one member"):
+        SharesSplit().split("10.00", {})
+
+
+def test_shares_split_rejects_negative_weight() -> None:
+    with pytest.raises(SplitError, match="weight for 'Bob' must not be negative"):
+        SharesSplit().split("10.00", {"Alice": Decimal(1), "Bob": Decimal(-1)})
+
+
+def test_shares_split_rejects_all_zero_weights() -> None:
+    with pytest.raises(SplitError, match="at least one positive weight"):
+        SharesSplit().split("10.00", {"Alice": Decimal(0), "Bob": Decimal("0.0")})
+
+
+def test_shares_split_is_registered() -> None:
+    strategy = get_strategy("shares")
+
+    assert isinstance(strategy, SharesSplit)
+    assert strategy.method is SplitMethod.SHARES

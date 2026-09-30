@@ -220,4 +220,52 @@ class EqualSplit(SplitStrategy):
         }
 
 
+class SharesSplit(SplitStrategy):
+    """Divides the total in proportion to each member's weight.
+
+    Weights can be anything that measures use, such as nights stayed or room
+    sizes. Each member gets ``total * weight / sum(weights)``. Fractional
+    weights such as ``1.5`` are allowed, and a member with weight zero gets
+    nothing.
+
+    Examples:
+        A 300.00 apartment where Alice stayed 2 nights and Bob 1 night:
+
+        >>> SharesSplit().split("300.00", {"Alice": 2, "Bob": 1})
+        {'Alice': Decimal('200.00'), 'Bob': Decimal('100.00')}
+    """
+
+    method = SplitMethod.SHARES
+
+    def raw_split(
+        self, total: Decimal, values: Mapping[str, Decimal]
+    ) -> dict[str, Decimal]:
+        """Returns ``total * weight / sum(weights)`` for each member.
+
+        Args:
+            total: The amount to divide. It may be negative.
+            values: A non-negative weight for each member.
+
+        Returns:
+            The unrounded amount for each member, in the order of ``values``.
+
+        Raises:
+            SplitError: If ``values`` is empty, a weight is negative, or all
+                weights are zero.
+        """
+        self._require_values(values)
+        for member, weight in values.items():
+            if weight < 0:
+                raise SplitError(
+                    f"Share weight for {member!r} must not be negative, got {weight}"
+                )
+        weight_sum = sum(values.values(), Decimal(0))
+        if weight_sum == 0:
+            raise SplitError("A shares split needs at least one positive weight")
+        return {
+            member: total * weight / weight_sum for member, weight in values.items()
+        }
+
+
 register_strategy(EqualSplit())
+register_strategy(SharesSplit())
