@@ -23,6 +23,7 @@ from typer.core import TyperGroup
 from spliteasy import __version__
 from spliteasy.cli.expense_cmds import expense_app, pay, settle, show_balance
 from spliteasy.cli.group_cmds import group_app, member_app
+from spliteasy.demo import DEMO_GROUPS, ITALY_TRIP, create_demo_data
 from spliteasy.exceptions import SplitEasyError
 from spliteasy.services import GroupService
 from spliteasy.storage import SQLiteRepository
@@ -104,3 +105,44 @@ def main(
 def version() -> None:
     """Show the installed SplitEasy version."""
     console.print(f"SplitEasy {__version__}")
+
+
+@app.command()
+def demo(
+    ctx: typer.Context,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes", "-y", help="Replace existing demo groups without asking."
+        ),
+    ] = False,
+) -> None:
+    """Create two example groups to explore SplitEasy with."""
+    service: GroupService = ctx.obj
+    existing = {name.casefold(): name for name in service.list_groups()}
+    replaced = [
+        existing[name.casefold()] for name in DEMO_GROUPS if name.casefold() in existing
+    ]
+    if replaced and not yes:
+        typer.confirm(
+            f"Replace the existing groups {', '.join(replaced)} with demo data?",
+            abort=True,
+        )
+
+    groups = create_demo_data(service)
+    console.print(f"Created demo groups: {', '.join(groups)}")
+    console.print()
+    show_balance(ctx, ITALY_TRIP)
+    console.print()
+    console.print(f"Suggested settlement for {ITALY_TRIP}:")
+    settle(ctx, ITALY_TRIP)
+    console.print()
+    console.print("Try next:")
+    for command in (
+        "spliteasy group list",
+        'spliteasy expense list "Italy Trip" --category food',
+        "spliteasy balance Flat",
+        "spliteasy settle Flat",
+        'spliteasy pay "Italy Trip" --from Dan --to Steve --amount 272.02',
+    ):
+        console.print(f"  {command}", markup=False)
