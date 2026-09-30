@@ -422,3 +422,126 @@ def test_expense_add_itemized_errors(
     assert message in result.stderr
     with service(db_path) as svc:
         assert svc.list_expenses("Flat") == []
+
+
+# expense show
+
+
+def table_cells(output: str) -> dict[str, list[str]]:
+    """Maps the first cell of every ASCII table row to the remaining cells."""
+    rows = {}
+    for line in output.splitlines():
+        if not line.startswith("|") or set(line) <= {"|", "-", "+"}:
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        rows[cells[0]] = cells[1:]
+    return rows
+
+
+def detail_lines(output: str) -> dict[str, str]:
+    """Maps the "Label:" lines printed above the table to their values."""
+    details = {}
+    for line in output.splitlines():
+        if line.startswith(("|", "+", "Expense #")):
+            continue
+        label, colon, value = line.partition(": ")
+        if colon:
+            details[label.strip()] = value.strip()
+    return details
+
+
+def test_expense_show_itemized(db_path: Path) -> None:
+    ok(
+        db_path, "expense", "add", "Flat", "Kaufland", "17.00", "-p", "Bob",
+        "--item", "Olive oil:6.00:Alice,Bob", "--item", "Protein bars:2.50:Alice:2",
+        "--item", "Yogurt:4.00:Alice", "--item", "Coffee:5.00:Bob",
+        "--item", "Deposit return:-0.25:Bob:4", "--discount", "2.00",
+        "--category", "groceries", "--date", "2026-09-15", "--note", "Weekly shop",
+    )  # fmt: skip
+
+    output = ok(db_path, "expense", "show", "flat", "1")
+
+    assert "Expense #1: Kaufland" in output
+    assert detail_lines(output) == {
+        "Date": "2026-09-15",
+        "Category": "groceries",
+        "Amount": "17.00 €",
+        "Paid by": "Bob",
+        "Split": "itemized",
+        "Note": "Weekly shop",
+    }
+    rows = table_cells(output)
+    assert rows["Item"] == ["Alice", "Bob"]
+    assert rows["Olive oil"] == ["3.00 €", "3.00 €"]
+    assert rows["Protein bars x2"] == ["5.00 €", "-"]
+    assert rows["Deposit return x4"] == ["-", "-1.00 €"]
+    assert rows["Discount"] == ["-1.26 €", "-0.74 €"]
+    assert rows["Total"] == ["10.74 €", "6.26 €"]
+
+
+def test_expense_show_matches_expense_add_breakdown(db_path: Path) -> None:
+    added = ok(
+        db_path, "expense", "add", "Flat", "Kaufland", "18.00", "-p", "Alice",
+        "--item", "Olive oil:6.00:Alice,Bob", "--item", "Coffee:14.00:Bob",
+        "--discount", "2",
+    )  # fmt: skip
+
+    shown = ok(db_path, "expense", "show", "Flat", "1")
+
+    assert table_cells(shown) == table_cells(added)
+
+
+def test_expense_show_equal(db_path: Path) -> None:
+    ok(db_path, "expense", "add", "Flat", "Dinner", "100", "-p", "Carol",
+       "--category", "food", "--date", "2026-09-01")  # fmt: skip
+
+    output = ok(db_path, "expense", "show", "Flat", "1")
+
+    assert "Expense #1: Dinner" in output
+    details = detail_lines(output)
+    assert details["Amount"] == "100.00 €"
+    assert details["Paid by"] == "Carol"
+    assert details["Split"] == "equal"
+    assert "Note" not in details
+    assert "Rate" not in details
+    rows = table_cells(output)
+    assert rows["Member"] == ["Share"]
+    assert rows["Alice"] == ["33.34 €"]
+    assert rows["Bob"] == ["33.33 €"]
+    assert rows["Carol"] == ["33.33 €"]
+
+
+def test_expense_show_foreign_currency(db_path: Path) -> None:
+    ok(
+        db_path, "expense", "add", "Flat", "Fondue", "96", "-p", "Alice",
+        "--currency", "CHF", "--rate", "1.06", "--split", "shares",
+        "--values", "Alice=1,Bob=1,Carol=2",
+    )  # fmt: skip
+
+    output = ok(db_path, "expense", "show", "Flat", "1")
+
+    details = detail_lines(output)
+    assert details["Amount"] == "96.00 CHF"
+    assert details["Rate"] == "1 CHF = 1.06 EUR"
+    assert details["Converted"] == "101.76 €"
+    assert details["Split"] == "shares"
+    rows = table_cells(output)
+    assert rows["Alice"] == ["25.44 €"]
+    assert rows["Bob"] == ["25.44 €"]
+    assert rows["Carol"] == ["50.88 €"]
+
+
+def test_expense_show_unknown_id_is_an_error(db_path: Path) -> None:
+    ok(db_path, "expense", "add", "Flat", "Dinner", "30", "-p", "Alice")
+
+    result = invoke(db_path, "expense", "show", "Flat", "99")
+
+    assert result.exit_code == 1
+    assert "Error: Expense 99 not found" in result.stderr
+
+
+def test_expense_show_unknown_group_is_an_error(db_path: Path) -> None:
+    result = invoke(db_path, "expense", "show", "Nowhere", "1")
+
+    assert result.exit_code == 1
+    assert "Group 'Nowhere' not found" in result.stderr

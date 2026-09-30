@@ -156,26 +156,52 @@ def add_expense(
 
 
 def _print_added_expense(expense: Expense, group_currency: str) -> None:
-    """Prints a confirmation and the table of computed shares."""
-    paid = format_money(expense.amount, expense.currency)
-    if expense.currency != group_currency:
-        converted = format_money(expense.base_amount(group_currency), group_currency)
-        paid = f"{paid} at rate {expense.rate_to_base} = {converted}"
+    """Prints a confirmation and how the expense was split."""
     console.print(
         f"Added expense #{expense.id}: {escape(expense.description)} "
-        f"({paid}, paid by {escape(expense.payer)})"
+        f"({amount_text(expense, group_currency)}, paid by {escape(expense.payer)})"
     )
+    console.print(split_table(expense, group_currency))
 
+
+def amount_text(expense: Expense, group_currency: str) -> str:
+    """Formats an expense amount, with its conversion if it is foreign.
+
+    Args:
+        expense: The expense.
+        group_currency: The currency of the expense's group.
+
+    Returns:
+        For example ``"30.00 €"``, or ``"96.00 CHF at rate 1.06 = 101.76 €"``
+        for an expense in another currency.
+    """
+    paid = format_money(expense.amount, expense.currency)
+    if expense.currency == group_currency:
+        return paid
+    converted = format_money(expense.base_amount(group_currency), group_currency)
+    return f"{paid} at rate {expense.rate_to_base} = {converted}"
+
+
+def split_table(expense: Expense, group_currency: str) -> Table:
+    """Builds the table that shows how an expense was split.
+
+    Args:
+        expense: An expense with computed shares.
+        group_currency: The currency of the shares.
+
+    Returns:
+        The itemised breakdown for an itemised expense, otherwise a table of
+        each member's share.
+    """
     if expense.split_method is SplitMethod.ITEMIZED:
-        console.print(itemized_breakdown_table(expense, group_currency))
-        return
+        return itemized_breakdown_table(expense, group_currency)
 
     table = Table(title="Shares", box=box.ASCII)
     table.add_column("Member")
     table.add_column("Share", justify="right")
     for share in expense.shares:
         table.add_row(escape(share.member), format_money(share.amount, group_currency))
-    console.print(table)
+    return table
 
 
 def itemized_breakdown_table(expense: Expense, group_currency: str) -> Table:
@@ -255,6 +281,44 @@ def list_expenses(
             expense.currency,
         )
     console.print(table)
+
+
+@expense_app.command("show")
+def show_expense(
+    ctx: typer.Context,
+    group: Annotated[str, typer.Argument(help="Name of the group.")],
+    expense_id: Annotated[int, typer.Argument(help="ID of the expense.")],
+) -> None:
+    """Show the details of one expense and how it was split."""
+    ledger = _service(ctx).get_ledger(group)
+    expense = ledger.get_expense(expense_id)
+    group_currency = ledger.group.currency
+
+    details = [
+        ("Date", expense.date.isoformat()),
+        ("Category", escape(expense.category)),
+        ("Amount", format_money(expense.amount, expense.currency)),
+    ]
+    if expense.currency != group_currency:
+        details += [
+            ("Rate", f"1 {expense.currency} = {expense.rate_to_base} {group_currency}"),
+            (
+                "Converted",
+                format_money(expense.base_amount(group_currency), group_currency),
+            ),
+        ]
+    details += [
+        ("Paid by", escape(expense.payer)),
+        ("Split", expense.split_method.value),
+    ]
+    if expense.note:
+        details.append(("Note", escape(expense.note)))
+
+    console.print(f"[bold]Expense #{expense.id}: {escape(expense.description)}[/]")
+    width = max(len(label) for label, _ in details) + 1
+    for label, value in details:
+        console.print(f"{label + ':':<{width}} {value}")
+    console.print(split_table(expense, group_currency))
 
 
 @expense_app.command("delete")
