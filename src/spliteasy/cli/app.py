@@ -21,6 +21,7 @@ from rich.markup import escape
 from typer.core import TyperGroup
 
 from spliteasy import __version__
+from spliteasy.cli.expense_cmds import expense_app, pay, settle, show_balance
 from spliteasy.cli.group_cmds import group_app, member_app
 from spliteasy.exceptions import SplitEasyError
 from spliteasy.services import GroupService
@@ -72,6 +73,10 @@ app = typer.Typer(
 )
 app.add_typer(group_app)
 app.add_typer(member_app)
+app.add_typer(expense_app)
+app.command("balance")(show_balance)
+app.command("settle")(settle)
+app.command("pay")(pay)
 
 
 @app.callback()
