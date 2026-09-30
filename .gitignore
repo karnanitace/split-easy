@@ -39,3 +39,7 @@ charts/
 .idea/
 *.swp
 .DS_Store
+
+# Generated charts (images kept for documentation live under docs/)
+*.png
+!docs/**/*.png
