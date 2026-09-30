@@ -13,6 +13,7 @@ All money is handled as `Decimal`, and every split adds up to the exact cent.
 - [Features](#features)
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [Example charts](#example-charts)
 - [Command reference](#command-reference)
 - [Example: an itemised grocery receipt](#example-an-itemised-grocery-receipt)
 - [Using SplitEasy as a library](#using-spliteasy-as-a-library)
@@ -125,6 +126,30 @@ Steve -> John: 39.34 €
 A positive balance means the member is owed money; a negative balance means
 they owe money.
 
+## Example charts
+
+These charts were created from the demo "Italy Trip" group with the following
+commands:
+
+```bash
+spliteasy chart "Italy Trip" --type balances --out docs/images/italy-trip-balances.png
+spliteasy chart "Italy Trip" --type categories --out docs/images/italy-trip-categories.png
+spliteasy chart "Italy Trip" --type members --out docs/images/italy-trip-members.png
+```
+
+Each member's net balance: green bars are members who are owed money, red bars
+are members who owe money.
+
+<img src="docs/images/italy-trip-balances.png" alt="Net balance per member in the Italy Trip demo group" width="600">
+
+Total spending per category, largest first, converted to the group currency.
+
+<img src="docs/images/italy-trip-categories.png" alt="Spending per category in the Italy Trip demo group" width="600">
+
+What each member paid next to what they owe.
+
+<img src="docs/images/italy-trip-members.png" alt="Amount paid and amount owed per member in the Italy Trip demo group" width="600">
+
 ## Command reference
 
 In the examples below, `spliteasy` stands for `uv run -m spliteasy`. Inside
@@ -234,6 +259,8 @@ spliteasy chart Flat --type members --out charts/flat.png
 `--type` is `balances` (the default), `categories` or `members`. Without
 `--out`, the file is saved in the current folder and named after the group
 and chart type.
+
+See [Example charts](#example-charts) for what they look like.
 
 ## Example: an itemised grocery receipt
 
@@ -406,8 +433,6 @@ pull request to `main`.
 - **Editing expenses**; today an expense is deleted and added again.
 - **A payments column in the `balance` table**, so it is visible why a
   balance differs from *paid − owed*.
-
-Itemised splitting and charts are both implemented.
 
 ## License
 
