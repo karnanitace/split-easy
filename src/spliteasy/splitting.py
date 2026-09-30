@@ -313,6 +313,89 @@ class PercentageSplit(SplitStrategy):
         }
 
 
+class ExactSplit(SplitStrategy):
+    """Uses an exact amount for each member.
+
+    The amounts must add up to exactly the total. A member with amount zero
+    pays nothing.
+
+    For a normal (positive) total, every amount must be zero or positive. For
+    a negative total, such as a refund item like a returned bottle deposit,
+    every amount must be zero or negative instead, so that each member's part
+    of the refund has the same sign as the refund itself.
+
+    Examples:
+        >>> ExactSplit().split("120.00", {"Alice": 40, "Bob": 30, "Carol": 50})
+        {'Alice': Decimal('40.00'), 'Bob': Decimal('30.00'), 'Carol': Decimal('50.00')}
+    """
+
+    method = SplitMethod.EXACT
+
+    def raw_split(
+        self, total: Decimal, values: Mapping[str, Decimal]
+    ) -> dict[str, Decimal]:
+        """Returns the exact amounts unchanged, after checking them.
+
+        Args:
+            total: The amount the exact amounts must add up to. It may be
+                negative.
+            values: The exact amount for each member. They must have the same
+                sign as ``total`` (or be zero).
+
+        Returns:
+            A new dict with each member's amount as a ``Decimal``, in the order
+            of ``values``.
+
+        Raises:
+            SplitError: If ``values`` is empty, an amount has the wrong sign,
+                or the amounts do not add up to exactly ``total``.
+        """
+        self._require_values(values)
+        amounts = {member: Decimal(amount) for member, amount in values.items()}
+        for member, amount in amounts.items():
+            if total >= 0 and amount < 0:
+                raise SplitError(
+                    f"Exact amount for {member!r} must not be negative, got {amount}"
+                )
+            if total < 0 and amount > 0:
+                raise SplitError(
+                    f"Exact amount for {member!r} must not be positive for a "
+                    f"negative total, got {amount}"
+                )
+
+        amount_sum = sum(amounts.values(), Decimal(0))
+        if amount_sum != total:
+            # Compared by size so that a refund whose parts are too small is
+            # also reported as "missing".
+            direction = "missing" if abs(amount_sum) < abs(total) else "exceeding"
+            shown_sum, shown_total, shown_difference = _same_places(
+                amount_sum, total, abs(total - amount_sum)
+            )
+            raise SplitError(
+                f"Exact amounts sum to {shown_sum} but the total is {shown_total} "
+                f"({direction} {shown_difference})"
+            )
+        return amounts
+
+
+def _same_places(*numbers: Decimal) -> list[Decimal]:
+    """Returns the numbers with the same number of decimal places for display.
+
+    Every number gets as many decimal places as the most precise one, so
+    ``115`` and ``120.00`` are shown as ``115.00`` and ``120.00``.
+
+    Args:
+        *numbers: Finite ``Decimal`` values.
+
+    Returns:
+        The numbers, quantised to a common exponent.
+    """
+    exponent = min(int(number.as_tuple().exponent) for number in numbers)
+    unit = Decimal(1).scaleb(exponent)
+    return [number.quantize(unit) for number in numbers]
+
+
 register_strategy(EqualSplit())
 register_strategy(SharesSplit())
 register_strategy(PercentageSplit())
+register_strategy(ExactSplit())

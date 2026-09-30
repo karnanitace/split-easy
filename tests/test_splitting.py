@@ -8,6 +8,7 @@ from spliteasy.exceptions import AllocationError, SplitError
 from spliteasy.models import SplitMethod
 from spliteasy.splitting import (
     EqualSplit,
+    ExactSplit,
     PercentageSplit,
     SharesSplit,
     SplitStrategy,
@@ -521,3 +522,130 @@ def test_percentage_split_is_registered() -> None:
 
     assert isinstance(strategy, PercentageSplit)
     assert strategy.method is SplitMethod.PERCENTAGE
+
+
+# ExactSplit
+
+
+def amounts(**values: str) -> dict[str, Decimal]:
+    return {member: Decimal(value) for member, value in values.items()}
+
+
+def test_exact_split_dinner_example() -> None:
+    values = amounts(Alice="40", Bob="30", Carol="50")
+
+    result = ExactSplit().split("120.00", values)
+
+    assert result == {
+        "Alice": Decimal("40.00"),
+        "Bob": Decimal("30.00"),
+        "Carol": Decimal("50.00"),
+    }
+
+
+def test_exact_raw_split_returns_values_as_new_dict() -> None:
+    values = amounts(Alice="40.00", Bob="80.00")
+
+    raw = ExactSplit().raw_split(Decimal("120.00"), values)
+
+    assert raw == values
+    assert raw is not values
+
+
+def test_exact_split_zero_amount_for_one_member() -> None:
+    values = amounts(Alice="120.00", Bob="0")
+
+    assert ExactSplit().split("120.00", values) == {
+        "Alice": Decimal("120.00"),
+        "Bob": Decimal("0.00"),
+    }
+
+
+def test_exact_split_accepts_integer_values() -> None:
+    values = {"Alice": 40, "Bob": 80}
+
+    result = ExactSplit().split("120.00", values)  # type: ignore[arg-type]
+
+    assert result == {"Alice": Decimal("40.00"), "Bob": Decimal("80.00")}
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        (
+            amounts(Alice="40.00", Bob="30.00", Carol="45.00"),
+            "Exact amounts sum to 115.00 but the total is 120.00 (missing 5.00)",
+        ),
+        (
+            amounts(Alice="40", Bob="30", Carol="45"),
+            "Exact amounts sum to 115.00 but the total is 120.00 (missing 5.00)",
+        ),
+        (
+            amounts(Alice="40.00", Bob="30.00", Carol="50.01"),
+            "Exact amounts sum to 120.01 but the total is 120.00 (exceeding 0.01)",
+        ),
+        (
+            amounts(Alice="100", Bob="100"),
+            "Exact amounts sum to 200.00 but the total is 120.00 (exceeding 80.00)",
+        ),
+    ],
+)
+def test_exact_split_rejects_wrong_sum(
+    values: dict[str, Decimal], message: str
+) -> None:
+    with pytest.raises(SplitError) as excinfo:
+        ExactSplit().split("120.00", values)
+
+    assert str(excinfo.value) == message
+
+
+def test_exact_split_rejects_negative_amount() -> None:
+    with pytest.raises(SplitError, match="Exact amount for 'Bob' must not be negative"):
+        ExactSplit().split("120.00", amounts(Alice="130", Bob="-10"))
+
+
+def test_exact_split_negative_total_with_non_positive_amounts() -> None:
+    values = amounts(Alice="-0.75", Bob="-0.25", Carol="0")
+
+    result = ExactSplit().split("-1.00", values)
+
+    assert result == {
+        "Alice": Decimal("-0.75"),
+        "Bob": Decimal("-0.25"),
+        "Carol": Decimal("0.00"),
+    }
+
+
+def test_exact_split_negative_total_rejects_positive_amount() -> None:
+    with pytest.raises(SplitError, match="must not be positive for a negative total"):
+        ExactSplit().split("-1.00", amounts(Alice="-1.50", Bob="0.50"))
+
+
+def test_exact_split_negative_total_reports_wrong_sum() -> None:
+    with pytest.raises(SplitError) as excinfo:
+        ExactSplit().split("-1.00", amounts(Alice="-0.75"))
+
+    assert str(excinfo.value) == (
+        "Exact amounts sum to -0.75 but the total is -1.00 (missing 0.25)"
+    )
+
+
+def test_exact_split_rejects_empty_values() -> None:
+    with pytest.raises(SplitError, match="at least one member"):
+        ExactSplit().split("10.00", {})
+
+
+def test_exact_split_is_registered() -> None:
+    strategy = get_strategy("exact")
+
+    assert isinstance(strategy, ExactSplit)
+    assert strategy.method is SplitMethod.EXACT
+
+
+def test_exact_split_negative_total_reports_exceeding_sum() -> None:
+    with pytest.raises(SplitError) as excinfo:
+        ExactSplit().split("-1.00", amounts(Alice="-0.75", Bob="-0.50"))
+
+    assert str(excinfo.value) == (
+        "Exact amounts sum to -1.25 but the total is -1.00 (exceeding 0.25)"
+    )
