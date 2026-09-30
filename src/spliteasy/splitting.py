@@ -32,8 +32,8 @@ from collections.abc import Mapping
 from decimal import Decimal
 from typing import ClassVar
 
-from spliteasy.exceptions import SplitError
-from spliteasy.models import SplitMethod
+from spliteasy.exceptions import InvalidAmountError, SplitError
+from spliteasy.models import Expense, Group, Share, SplitMethod
 from spliteasy.money import distribute_remainder, to_money
 
 _REGISTRY: dict[SplitMethod, "SplitStrategy"] = {}
@@ -399,3 +399,132 @@ register_strategy(EqualSplit())
 register_strategy(SharesSplit())
 register_strategy(PercentageSplit())
 register_strategy(ExactSplit())
+
+
+def compute_shares(expense: Expense, group: Group) -> list[Share]:
+    """Computes how much of an expense each member owes.
+
+    The expense is split in its own currency first, with the strategy for its
+    split method. The unrounded amounts are then converted to the group's
+    currency with the expense's frozen exchange rate and rounded **once**
+    with the largest remainder method against the converted total:
+
+    * Splitting in the expense currency keeps the user's input meaningful:
+      exact amounts and the receipt refer to the currency that was paid.
+    * Rounding only once, after conversion, avoids rounding twice (once in
+      each currency), which could make the shares disagree with the
+      converted total by a cent or more.
+
+    The rounding step cannot fail. The raw amounts sum to the expense amount,
+    so the converted raw amounts sum exactly to ``amount * rate_to_base``,
+    and the converted total is the half-up rounding of that sum. It therefore
+    differs from the sum of the rounded-down amounts by between zero and one
+    minor unit per member, which is exactly what largest remainder allows.
+
+    Args:
+        expense: The expense to split.
+        group: The group the expense belongs to. Its members are used to
+            validate and resolve names, and its currency is the currency of
+            the shares.
+
+    Returns:
+        One share per member taking part, in the order of the split input,
+        using the members' stored spelling. The amounts are in the group's
+        currency and sum exactly to ``expense.base_amount(group.currency)``.
+        Members whose amount is zero (for example an exact amount of 0) are
+        included.
+
+    Raises:
+        SplitError: If the group has no members, the split values are not
+            valid for the split method, or the expense is itemised (not
+            supported yet).
+        MemberNotFoundError: If the payer or any other name used in the
+            expense is not a member of the group.
+    """
+    if not group.members:
+        raise SplitError(f"Group {group.name!r} has no members to split between")
+    for name in expense.involved_members:
+        group.resolve_name(name)
+
+    values = _strategy_values(expense, group)
+    strategy = get_strategy(expense.split_method)
+    raw = strategy.raw_split(expense.amount, values)
+    raw_base = {member: amount * expense.rate_to_base for member, amount in raw.items()}
+    total_base = expense.base_amount(group.currency)
+    amounts = distribute_remainder(raw_base, total_base, group.currency)
+    return [Share(member, amount) for member, amount in amounts.items()]
+
+
+def apply_split(expense: Expense, group: Group) -> Expense:
+    """Computes an expense's shares and stores them on the expense.
+
+    This **mutates** ``expense``: its ``shares`` list is replaced.
+
+    Args:
+        expense: The expense to split.
+        group: The group the expense belongs to.
+
+    Returns:
+        The same expense object, so calls can be chained.
+
+    Raises:
+        SplitError: If the expense cannot be split (see :func:`compute_shares`).
+        MemberNotFoundError: If a name used in the expense is not a member of
+            the group.
+    """
+    expense.shares = compute_shares(expense, group)
+    return expense
+
+
+def _strategy_values(expense: Expense, group: Group) -> dict[str, Decimal]:
+    """Builds the strategy input for an expense, using stored member names.
+
+    Args:
+        expense: The expense to split.
+        group: The group used to resolve member names.
+
+    Returns:
+        The value for each member, keyed by the member's stored name.
+
+    Raises:
+        SplitError: If the expense is itemised, or an exact amount is not a
+            valid amount in the expense currency.
+        MemberNotFoundError: If a name is not a member of the group.
+    """
+    method = expense.split_method
+    if method is SplitMethod.ITEMIZED:
+        raise SplitError("Itemized splits are not supported yet")
+    if method is SplitMethod.EQUAL:
+        names = expense.participants or group.member_names
+        return {group.resolve_name(name): Decimal(1) for name in names}
+
+    values = {
+        group.resolve_name(name): value for name, value in expense.split_values.items()
+    }
+    if method is SplitMethod.EXACT:
+        for member, value in values.items():
+            _check_exact_amount(member, value, expense.currency)
+    return values
+
+
+def _check_exact_amount(member: str, value: Decimal, currency: str) -> None:
+    """Checks that an exact amount is a valid amount in a currency.
+
+    Args:
+        member: The member the amount belongs to, used in error messages.
+        value: The exact amount.
+        currency: The currency of the amount.
+
+    Raises:
+        SplitError: If the amount cannot be converted with
+            :func:`~spliteasy.money.to_money` or has more decimal places than
+            the currency allows (for example ``10.005`` EUR or ``10.5`` JPY).
+    """
+    try:
+        amount = to_money(value, currency)
+    except InvalidAmountError as err:
+        raise SplitError(f"Invalid exact amount for {member!r}: {err}") from err
+    if amount != value:
+        raise SplitError(
+            f"Exact amount {value} for {member!r} is not a valid {currency} amount"
+        )

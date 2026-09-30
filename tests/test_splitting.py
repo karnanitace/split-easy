@@ -4,14 +4,16 @@ from decimal import Decimal
 import pytest
 
 from spliteasy import splitting
-from spliteasy.exceptions import AllocationError, SplitError
-from spliteasy.models import SplitMethod
+from spliteasy.exceptions import AllocationError, MemberNotFoundError, SplitError
+from spliteasy.models import Expense, Group, LineItem, Member, Share, SplitMethod
 from spliteasy.splitting import (
     EqualSplit,
     ExactSplit,
     PercentageSplit,
     SharesSplit,
     SplitStrategy,
+    apply_split,
+    compute_shares,
     get_strategy,
     register_strategy,
 )
@@ -649,3 +651,237 @@ def test_exact_split_negative_total_reports_exceeding_sum() -> None:
     assert str(excinfo.value) == (
         "Exact amounts sum to -1.25 but the total is -1.00 (exceeding 0.25)"
     )
+
+
+# compute_shares and apply_split
+
+
+@pytest.fixture
+def flat() -> Group:
+    return Group(
+        name="Flat",
+        members=[Member("Alice"), Member("Bob"), Member("Carol")],
+    )
+
+
+def make_expense(**overrides: object) -> Expense:
+    fields: dict[str, object] = {
+        "description": "Dinner",
+        "amount": Decimal("120.00"),
+        "payer": "Alice",
+    }
+    fields.update(overrides)
+    return Expense(**fields)  # type: ignore[arg-type]
+
+
+def as_dict(shares: list[Share]) -> dict[str, Decimal]:
+    return {share.member: share.amount for share in shares}
+
+
+def test_equal_split_with_explicit_participants(flat: Group) -> None:
+    expense = make_expense(amount="10.00", participants=["Alice", "Bob"])
+
+    shares = compute_shares(expense, flat)
+
+    assert shares == [Share("Alice", Decimal("5.00")), Share("Bob", Decimal("5.00"))]
+
+
+def test_equal_split_among_all_members_when_participants_empty(flat: Group) -> None:
+    expense = make_expense(amount="100.00")
+
+    shares = compute_shares(expense, flat)
+
+    assert as_dict(shares) == {
+        "Alice": Decimal("33.34"),
+        "Bob": Decimal("33.33"),
+        "Carol": Decimal("33.33"),
+    }
+
+
+def test_names_are_resolved_to_stored_spelling(flat: Group) -> None:
+    expense = make_expense(
+        amount="10.00", payer="alice", participants=["CAROL", " bob "]
+    )
+
+    shares = compute_shares(expense, flat)
+
+    assert [share.member for share in shares] == ["Carol", "Bob"]
+
+
+def test_exact_split_end_to_end(flat: Group) -> None:
+    expense = make_expense(
+        split_method="exact",
+        split_values={"alice": "40", "Bob": "30", "Carol": "50"},
+    )
+
+    shares = compute_shares(expense, flat)
+
+    assert as_dict(shares) == {
+        "Alice": Decimal("40.00"),
+        "Bob": Decimal("30.00"),
+        "Carol": Decimal("50.00"),
+    }
+
+
+def test_exact_split_keeps_zero_amount_members(flat: Group) -> None:
+    expense = make_expense(split_method="exact", split_values={"Alice": 120, "Bob": 0})
+
+    shares = compute_shares(expense, flat)
+
+    assert shares == [Share("Alice", Decimal("120.00")), Share("Bob", Decimal("0.00"))]
+
+
+def test_exact_split_rejects_wrong_sum_end_to_end(flat: Group) -> None:
+    expense = make_expense(split_method="exact", split_values={"Alice": 40, "Bob": 30})
+
+    with pytest.raises(SplitError, match=r"missing 50\.00"):
+        compute_shares(expense, flat)
+
+
+@pytest.mark.parametrize(("value", "currency"), [("60.005", "EUR"), ("60.5", "JPY")])
+def test_exact_split_rejects_amount_with_too_many_decimals(
+    flat: Group, value: str, currency: str
+) -> None:
+    expense = make_expense(
+        amount="120.005" if currency == "EUR" else "121",
+        currency=currency,
+        split_method="exact",
+        split_values={"Alice": value, "Bob": "60.5" if currency == "JPY" else "60"},
+    )
+
+    with pytest.raises(SplitError, match=f"not a valid {currency} amount"):
+        compute_shares(expense, flat)
+
+
+def test_percentage_split_end_to_end(flat: Group) -> None:
+    expense = make_expense(
+        amount="50.00", split_method="percentage", split_values={"Alice": 60, "Bob": 40}
+    )
+
+    assert as_dict(compute_shares(expense, flat)) == {
+        "Alice": Decimal("30.00"),
+        "Bob": Decimal("20.00"),
+    }
+
+
+def test_shares_split_end_to_end(flat: Group) -> None:
+    expense = make_expense(
+        amount="300.00", split_method="shares", split_values={"Alice": 2, "Carol": 1}
+    )
+
+    assert as_dict(compute_shares(expense, flat)) == {
+        "Alice": Decimal("200.00"),
+        "Carol": Decimal("100.00"),
+    }
+
+
+def test_chf_expense_shares_sum_to_converted_total(flat: Group) -> None:
+    expense = make_expense(
+        amount="96.00",
+        currency="CHF",
+        rate_to_base="1.06",
+        split_method="shares",
+        split_values={"Alice": 1, "Bob": 1, "Carol": 2},
+    )
+
+    shares = compute_shares(expense, flat)
+
+    assert expense.base_amount("EUR") == Decimal("101.76")
+    assert as_dict(shares) == {
+        "Alice": Decimal("25.44"),
+        "Bob": Decimal("25.44"),
+        "Carol": Decimal("50.88"),
+    }
+    assert sum(share.amount for share in shares) == Decimal("101.76")
+
+
+def test_converted_split_rounds_once_after_conversion(flat: Group) -> None:
+    expense = make_expense(amount="100.00", currency="CHF", rate_to_base="1.0612")
+
+    shares = compute_shares(expense, flat)
+
+    assert expense.base_amount("EUR") == Decimal("106.12")
+    assert sum(share.amount for share in shares) == Decimal("106.12")
+    assert as_dict(shares) == {
+        "Alice": Decimal("35.38"),
+        "Bob": Decimal("35.37"),
+        "Carol": Decimal("35.37"),
+    }
+
+
+def test_shares_use_group_currency_minor_unit() -> None:
+    group = Group(name="Tokyo", currency="JPY", members=[Member("A"), Member("B")])
+    expense = make_expense(
+        amount="10.00", payer="A", currency="EUR", rate_to_base="161.37"
+    )
+
+    shares = compute_shares(expense, group)
+
+    assert as_dict(shares) == {"A": Decimal("807"), "B": Decimal("807")}
+    assert sum(share.amount for share in shares) == expense.base_amount("JPY")
+
+
+def test_unknown_payer_raises_member_not_found(flat: Group) -> None:
+    with pytest.raises(MemberNotFoundError, match="Member 'Dave' not found"):
+        compute_shares(make_expense(payer="Dave"), flat)
+
+
+def test_unknown_participant_raises_member_not_found(flat: Group) -> None:
+    expense = make_expense(participants=["Alice", "Dave"])
+
+    with pytest.raises(MemberNotFoundError, match="Member 'Dave' not found"):
+        compute_shares(expense, flat)
+
+
+def test_unknown_split_value_member_raises_member_not_found(flat: Group) -> None:
+    expense = make_expense(split_method="shares", split_values={"Alice": 1, "Eve": 1})
+
+    with pytest.raises(MemberNotFoundError, match="'Eve'"):
+        compute_shares(expense, flat)
+
+
+def test_group_without_members_raises_split_error() -> None:
+    with pytest.raises(SplitError, match="has no members"):
+        compute_shares(make_expense(), Group(name="Empty"))
+
+
+def test_itemized_split_is_not_supported_yet(flat: Group) -> None:
+    expense = make_expense(
+        split_method="itemized",
+        items=[LineItem.for_members("Pizza", "120.00", ["Alice", "Bob"])],
+    )
+
+    with pytest.raises(SplitError, match="Itemized splits are not supported yet"):
+        compute_shares(expense, flat)
+
+
+def test_compute_shares_does_not_modify_expense(flat: Group) -> None:
+    expense = make_expense()
+
+    compute_shares(expense, flat)
+
+    assert expense.shares == []
+
+
+def test_apply_split_sets_shares_and_returns_expense(flat: Group) -> None:
+    expense = make_expense(amount="9.00")
+
+    result = apply_split(expense, flat)
+
+    assert result is expense
+    assert expense.shares == [
+        Share("Alice", Decimal("3.00")),
+        Share("Bob", Decimal("3.00")),
+        Share("Carol", Decimal("3.00")),
+    ]
+    assert expense.share_of("bob") == Decimal("3.00")
+
+
+def test_apply_split_replaces_existing_shares(flat: Group) -> None:
+    expense = make_expense(amount="9.00", participants=["Alice", "Bob"])
+    apply_split(expense, flat)
+    expense.participants = ["Carol"]
+
+    apply_split(expense, flat)
+
+    assert expense.shares == [Share("Carol", Decimal("9.00"))]
