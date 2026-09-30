@@ -23,7 +23,7 @@ invalid object can never be created.
 """
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
@@ -678,8 +678,7 @@ class Expense:
             raise ValidationError("Expense category must not be empty")
         self.category = category
 
-        if isinstance(self.date, datetime) or not isinstance(self.date, date):
-            raise ValidationError(f"Expense date must be a date, got {self.date!r}")
+        _check_date(self.date, "Expense")
 
         self.rate_to_base = parse_decimal(self.rate_to_base)
         if self.rate_to_base <= 0:
@@ -804,6 +803,175 @@ class Expense:
             raise ValidationError(
                 "An 'equal' expense must not have split values; use participants"
             )
+
+
+@dataclass(slots=True, kw_only=True)
+class Payment:
+    """Money one member actually sent to another to settle a debt.
+
+    A payment is a record of something that happened: the user enters it
+    after paying, and it changes the balances of both members. A
+    :class:`Transfer` is only a suggestion from the settlement algorithm; it
+    becomes a payment once the money has been sent (see
+    :meth:`Transfer.to_payment`).
+
+    Attributes:
+        from_member: The name of the member who sent the money.
+        to_member: The name of the member who received it. It must differ
+            from ``from_member``, ignoring case.
+        amount: The amount sent, always in the group's base currency. It is
+            rounded to two decimal places and must be greater than zero.
+        date: The day the money was sent.
+        note: An optional free-text note, stripped of surrounding whitespace.
+        id: The database id, or ``None`` if the payment has not been saved.
+        group_id: The id of the group the payment belongs to, or ``None``.
+    """
+
+    from_member: str
+    to_member: str
+    amount: Decimal
+    date: date = field(default_factory=date.today)
+    note: str = ""
+    id: int | None = None
+    group_id: int | None = None
+
+    def __post_init__(self) -> None:
+        """Normalises and validates all fields.
+
+        Raises:
+            ValidationError: If a name is invalid, both names are the same
+                member, the amount is not positive, the date is not a date, or
+                the note is not a string.
+            InvalidAmountError: If the amount cannot be parsed.
+        """
+        self.from_member = normalize_name(self.from_member, kind="Sender name")
+        self.to_member = normalize_name(self.to_member, kind="Recipient name")
+        _check_different_members(self.from_member, self.to_member, "A payment")
+        self.amount = _positive_money(self.amount, "Payment amount")
+        _check_date(self.date, "Payment")
+        if not isinstance(self.note, str):
+            raise ValidationError(f"Payment note must be a string, got {self.note!r}")
+        self.note = self.note.strip()
+
+
+@dataclass(frozen=True, slots=True)
+class Transfer:
+    """A payment suggested by the settlement algorithm that has not been made.
+
+    Transfers are computed from the current balances and are never stored;
+    they change whenever the balances change. Once the debtor has actually
+    sent the money, the transfer is recorded as a :class:`Payment` with
+    :meth:`to_payment`.
+
+    Attributes:
+        debtor: The name of the member who should pay.
+        creditor: The name of the member who should be paid. It must differ
+            from ``debtor``, ignoring case.
+        amount: The suggested amount in the group's base currency, rounded to
+            two decimal places. It must be greater than zero.
+    """
+
+    debtor: str
+    creditor: str
+    amount: Decimal
+
+    def __post_init__(self) -> None:
+        """Normalises and validates all fields.
+
+        Raises:
+            ValidationError: If a name is invalid, both names are the same
+                member, or the amount is not positive.
+            InvalidAmountError: If the amount cannot be parsed.
+        """
+        object.__setattr__(
+            self, "debtor", normalize_name(self.debtor, kind="Debtor name")
+        )
+        object.__setattr__(
+            self, "creditor", normalize_name(self.creditor, kind="Creditor name")
+        )
+        _check_different_members(self.debtor, self.creditor, "A transfer")
+        object.__setattr__(
+            self, "amount", _positive_money(self.amount, "Transfer amount")
+        )
+
+    def __str__(self) -> str:
+        """Returns the transfer as ``"Bob -> Alice: 8.00"``."""
+        return f"{self.debtor} -> {self.creditor}: {self.amount}"
+
+    def to_payment(self, date: date | None = None, note: str = "") -> Payment:
+        """Converts the suggestion into a payment that can be recorded.
+
+        Args:
+            date: The day the money was sent. Defaults to today.
+            note: An optional note for the payment.
+
+        Returns:
+            A new, unsaved payment from the debtor to the creditor for the
+            suggested amount.
+
+        Raises:
+            ValidationError: If the date or note is invalid.
+        """
+        payment = Payment(
+            from_member=self.debtor,
+            to_member=self.creditor,
+            amount=self.amount,
+            note=note,
+        )
+        # The parameter shadows the date class, so the default is left to
+        # Payment and an explicit date is applied with a validated copy.
+        return payment if date is None else replace(payment, date=date)
+
+
+def _check_different_members(first: str, second: str, what: str) -> None:
+    """Checks that two member names refer to different members.
+
+    Args:
+        first: A normalised member name.
+        second: Another normalised member name.
+        what: What the names belong to, used at the start of error messages.
+
+    Raises:
+        ValidationError: If the names are equal, ignoring case.
+    """
+    if first.casefold() == second.casefold():
+        raise ValidationError(
+            f"{what} needs two different members, got {first!r} twice"
+        )
+
+
+def _positive_money(value: Decimal | int | str, what: str) -> Decimal:
+    """Converts a value with :func:`to_money` and checks that it is positive.
+
+    Args:
+        value: The amount to convert.
+        what: What the amount is, used at the start of error messages.
+
+    Returns:
+        The amount rounded to two decimal places.
+
+    Raises:
+        ValidationError: If the rounded amount is zero or negative.
+        InvalidAmountError: If the amount cannot be parsed.
+    """
+    amount = to_money(value)
+    if amount <= 0:
+        raise ValidationError(f"{what} must be greater than zero, got {amount}")
+    return amount
+
+
+def _check_date(value: object, what: str) -> None:
+    """Checks that a value is a plain date and not a datetime.
+
+    Args:
+        value: The value to check.
+        what: What the date belongs to, used at the start of error messages.
+
+    Raises:
+        ValidationError: If the value is not a ``date`` or is a ``datetime``.
+    """
+    if isinstance(value, datetime) or not isinstance(value, date):
+        raise ValidationError(f"{what} date must be a date, got {value!r}")
 
 
 def _check_instances(values: Iterable[object], cls: type[T], what: str) -> list[T]:

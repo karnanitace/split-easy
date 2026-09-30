@@ -23,8 +23,10 @@ from spliteasy.models import (
     Group,
     LineItem,
     Member,
+    Payment,
     Share,
     SplitMethod,
+    Transfer,
     normalize_name,
 )
 
@@ -1030,3 +1032,160 @@ def test_expense_is_mutable_entity() -> None:
 
     assert expense.share_of("Alice") == Decimal("30.00")
     assert not hasattr(expense, "__dict__")
+
+
+# Payment
+
+
+def test_payment_normalizes_fields() -> None:
+    payment = Payment(
+        from_member="  Bob ",
+        to_member="Alice",
+        amount="8,005",  # type: ignore[arg-type]
+        note="  cash ",
+        date=date(2026, 9, 1),
+    )
+
+    assert payment.from_member == "Bob"
+    assert payment.to_member == "Alice"
+    assert payment.amount == Decimal("8.01")
+    assert payment.note == "cash"
+    assert payment.date == date(2026, 9, 1)
+
+
+def test_payment_defaults() -> None:
+    payment = Payment(from_member="Bob", to_member="Alice", amount=Decimal(8))
+
+    assert payment.amount == Decimal("8.00")
+    assert payment.date == date.today()
+    assert payment.note == ""
+    assert payment.id is None
+    assert payment.group_id is None
+
+
+def test_payment_is_mutable_entity() -> None:
+    payment = Payment(from_member="Bob", to_member="Alice", amount=Decimal(8))
+
+    payment.id = 3
+    payment.group_id = 1
+
+    assert payment.id == 3
+    assert not hasattr(payment, "__dict__")
+
+
+@pytest.mark.parametrize(("sender", "recipient"), [("Bob", "Bob"), ("Bob", " BOB ")])
+def test_payment_rejects_same_member_twice(sender: str, recipient: str) -> None:
+    with pytest.raises(ValidationError, match="two different members"):
+        Payment(from_member=sender, to_member=recipient, amount=Decimal(8))
+
+
+@pytest.mark.parametrize("amount", [0, "0.00", "-8", "0.004"])
+def test_payment_rejects_non_positive_amount(amount: object) -> None:
+    with pytest.raises(ValidationError, match="greater than zero"):
+        Payment(from_member="Bob", to_member="Alice", amount=amount)  # type: ignore[arg-type]
+
+
+def test_payment_rejects_unparsable_amount() -> None:
+    with pytest.raises(InvalidAmountError):
+        Payment(from_member="Bob", to_member="Alice", amount="eight")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"from_member": ""}, "^Sender name must not be empty$"),
+        ({"to_member": "  "}, "^Recipient name must not be empty$"),
+        ({"date": datetime(2026, 9, 1)}, "Payment date must be a date"),
+        ({"note": None}, "note must be a string"),
+    ],
+)
+def test_payment_rejects_invalid_fields(
+    overrides: dict[str, object], message: str
+) -> None:
+    fields: dict[str, object] = {
+        "from_member": "Bob",
+        "to_member": "Alice",
+        "amount": Decimal(8),
+    }
+    fields.update(overrides)
+
+    with pytest.raises(ValidationError, match=message):
+        Payment(**fields)  # type: ignore[arg-type]
+
+
+# Transfer
+
+
+def test_transfer_normalizes_fields() -> None:
+    transfer = Transfer(" Bob ", "Alice", "8")  # type: ignore[arg-type]
+
+    assert transfer.debtor == "Bob"
+    assert transfer.creditor == "Alice"
+    assert transfer.amount == Decimal("8.00")
+
+
+@pytest.mark.parametrize(
+    ("amount", "expected"),
+    [
+        (Decimal("8"), "Bob -> Alice: 8.00"),
+        (Decimal("1234.5"), "Bob -> Alice: 1234.50"),
+    ],
+)
+def test_transfer_str(amount: Decimal, expected: str) -> None:
+    assert str(Transfer("Bob", "Alice", amount)) == expected
+
+
+@pytest.mark.parametrize(("debtor", "creditor"), [("Bob", "Bob"), ("bob", "BOB")])
+def test_transfer_rejects_same_member_twice(debtor: str, creditor: str) -> None:
+    with pytest.raises(ValidationError, match="two different members"):
+        Transfer(debtor, creditor, Decimal(8))
+
+
+@pytest.mark.parametrize("amount", [0, "0.00", "-8"])
+def test_transfer_rejects_non_positive_amount(amount: object) -> None:
+    with pytest.raises(ValidationError, match="Transfer amount must be greater"):
+        Transfer("Bob", "Alice", amount)  # type: ignore[arg-type]
+
+
+def test_transfer_rejects_empty_names() -> None:
+    with pytest.raises(ValidationError, match="^Debtor name must not be empty$"):
+        Transfer("", "Alice", Decimal(8))
+    with pytest.raises(ValidationError, match="^Creditor name must not be empty$"):
+        Transfer("Bob", " ", Decimal(8))
+
+
+def test_transfer_is_frozen_value_object() -> None:
+    transfer = Transfer("Bob", "Alice", Decimal("8.00"))
+
+    assert transfer == Transfer("Bob", "Alice", Decimal("8"))
+    assert len({transfer, Transfer("Bob", "Alice", Decimal("8.00"))}) == 1
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        transfer.amount = Decimal(9)  # type: ignore[misc]
+
+
+def test_transfer_to_payment_defaults() -> None:
+    payment = Transfer("Bob", "Alice", Decimal("8.00")).to_payment()
+
+    assert isinstance(payment, Payment)
+    assert payment.from_member == "Bob"
+    assert payment.to_member == "Alice"
+    assert payment.amount == Decimal("8.00")
+    assert payment.date == date.today()
+    assert payment.note == ""
+    assert payment.id is None
+
+
+def test_transfer_to_payment_with_date_and_note() -> None:
+    transfer = Transfer("Bob", "Alice", Decimal("8.00"))
+
+    payment = transfer.to_payment(date=date(2026, 9, 30), note=" PayPal ")
+
+    assert payment.date == date(2026, 9, 30)
+    assert payment.note == "PayPal"
+
+
+def test_transfer_to_payment_validates_date() -> None:
+    transfer = Transfer("Bob", "Alice", Decimal("8.00"))
+
+    with pytest.raises(ValidationError, match="Payment date must be a date"):
+        transfer.to_payment(date="2026-09-30")  # type: ignore[arg-type]
