@@ -169,3 +169,55 @@ def get_strategy(method: SplitMethod | str) -> SplitStrategy:
         raise SplitError(
             f"No split strategy is registered for {split_method.value!r}"
         ) from None
+
+
+class EqualSplit(SplitStrategy):
+    """Divides the total equally among the included members.
+
+    The values act as "included" flags: a member whose value is greater than
+    zero takes part, and a member whose value is zero does not. Both
+    ``{"Alice": 1, "Bob": 1}`` and ``{"Alice": 1, "Bob": 0}`` are valid. Every
+    key appears in the result; excluded members get ``Decimal("0")``.
+
+    Examples:
+        >>> EqualSplit().split("100.00", {"Alice": 1, "Bob": 1, "Carol": 1})
+        {'Alice': Decimal('33.34'), 'Bob': Decimal('33.33'), 'Carol': Decimal('33.33')}
+    """
+
+    method = SplitMethod.EQUAL
+
+    def raw_split(
+        self, total: Decimal, values: Mapping[str, Decimal]
+    ) -> dict[str, Decimal]:
+        """Returns ``total / n`` for each of the ``n`` included members.
+
+        Args:
+            total: The amount to divide. It may be negative.
+            values: An inclusion flag for each member: greater than zero to
+                include the member, zero to exclude them.
+
+        Returns:
+            The unrounded amount for each member, in the order of ``values``,
+            with ``Decimal("0")`` for excluded members.
+
+        Raises:
+            SplitError: If ``values`` is empty, a flag is negative, or no
+                member is included.
+        """
+        self._require_values(values)
+        negative = [member for member, flag in values.items() if flag < 0]
+        if negative:
+            raise SplitError(
+                f"Equal split flags must not be negative, got one for {negative[0]!r}"
+            )
+        included = [member for member, flag in values.items() if flag > 0]
+        if not included:
+            raise SplitError("An equal split needs at least one included member")
+        amount = total / len(included)
+        return {
+            member: amount if flag > 0 else Decimal("0")
+            for member, flag in values.items()
+        }
+
+
+register_strategy(EqualSplit())
