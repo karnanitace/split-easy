@@ -9,6 +9,7 @@ import pytest
 from spliteasy.exceptions import (
     CurrencyError,
     DuplicateError,
+    ExpenseNotFoundError,
     InvalidAmountError,
     MemberNotFoundError,
     ValidationError,
@@ -21,6 +22,7 @@ from spliteasy.models import (
     DistributionMode,
     Expense,
     Group,
+    Ledger,
     LineItem,
     Member,
     Payment,
@@ -1189,3 +1191,150 @@ def test_transfer_to_payment_validates_date() -> None:
 
     with pytest.raises(ValidationError, match="Payment date must be a date"):
         transfer.to_payment(date="2026-09-30")  # type: ignore[arg-type]
+
+
+# Ledger
+
+
+def ledger_expense(expense_id: int | None, description: str = "Dinner") -> Expense:
+    return make_expense(description=description, id=expense_id)
+
+
+def ledger_payment(payment_id: int | None) -> Payment:
+    return Payment(
+        from_member="Bob", to_member="Alice", amount=Decimal(5), id=payment_id
+    )
+
+
+@pytest.fixture
+def ledger() -> Ledger:
+    return Ledger(
+        group=Group(name="Flat", members=[Member("Alice"), Member("Bob")]),
+        expenses=[ledger_expense(1, "Rent"), ledger_expense(4, "Power")],
+        payments=[ledger_payment(2)],
+    )
+
+
+def test_ledger_defaults_to_empty_lists() -> None:
+    ledger = Ledger(group=Group(name="Flat"))
+
+    assert ledger.expenses == []
+    assert ledger.payments == []
+    assert Ledger(group=Group(name="Other")).expenses is not ledger.expenses
+
+
+def test_ledger_copies_input_lists() -> None:
+    expenses = [ledger_expense(1)]
+
+    ledger = Ledger(group=Group(name="Flat"), expenses=expenses)
+    expenses.append(ledger_expense(2))
+
+    assert len(ledger.expenses) == 1
+
+
+def test_ledger_is_keyword_only_and_mutable() -> None:
+    with pytest.raises(TypeError):
+        Ledger(Group(name="Flat"))  # type: ignore[misc]
+
+    ledger = Ledger(group=Group(name="Flat"))
+    ledger.expenses.append(ledger_expense(1))
+
+    assert len(ledger.expenses) == 1
+    assert not hasattr(ledger, "__dict__")
+
+
+def test_next_ids_start_at_one() -> None:
+    ledger = Ledger(group=Group(name="Flat"))
+
+    assert ledger.next_expense_id() == 1
+    assert ledger.next_payment_id() == 1
+
+
+def test_next_ids_are_max_plus_one(ledger: Ledger) -> None:
+    assert ledger.next_expense_id() == 5
+    assert ledger.next_payment_id() == 3
+
+
+def test_next_ids_ignore_unsaved_objects() -> None:
+    ledger = Ledger(
+        group=Group(name="Flat"),
+        expenses=[ledger_expense(None), ledger_expense(2), ledger_expense(None)],
+        payments=[ledger_payment(None)],
+    )
+
+    assert ledger.next_expense_id() == 3
+    assert ledger.next_payment_id() == 1
+
+
+def test_next_expense_id_does_not_reuse_removed_ids_below_max(ledger: Ledger) -> None:
+    ledger.remove_expense(1)
+
+    assert ledger.next_expense_id() == 5
+
+
+def test_get_expense(ledger: Ledger) -> None:
+    assert ledger.get_expense(4).description == "Power"
+    assert ledger.get_expense(1) is ledger.expenses[0]
+
+
+@pytest.mark.parametrize("expense_id", [2, 99, 0])
+def test_get_expense_raises_for_missing_id(ledger: Ledger, expense_id: int) -> None:
+    with pytest.raises(ExpenseNotFoundError) as excinfo:
+        ledger.get_expense(expense_id)
+
+    assert excinfo.value.identifier == expense_id
+    assert str(excinfo.value) == f"Expense {expense_id} not found"
+
+
+def test_remove_expense(ledger: Ledger) -> None:
+    ledger.remove_expense(1)
+
+    assert [expense.id for expense in ledger.expenses] == [4]
+
+
+def test_remove_expense_raises_for_missing_id(ledger: Ledger) -> None:
+    with pytest.raises(ExpenseNotFoundError):
+        ledger.remove_expense(3)
+
+    assert [expense.id for expense in ledger.expenses] == [1, 4]
+
+
+def test_ledger_rejects_non_group() -> None:
+    with pytest.raises(ValidationError, match="Ledger group must be a Group"):
+        Ledger(group="Flat")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"expenses": ["Rent"]}, "Ledger expenses must be Expense objects"),
+        ({"payments": [ledger_expense(1)]}, "Ledger payments must be Payment objects"),
+    ],
+)
+def test_ledger_rejects_wrong_object_types(
+    overrides: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        Ledger(group=Group(name="Flat"), **overrides)  # type: ignore[arg-type]
+
+
+def test_ledger_rejects_duplicate_expense_ids() -> None:
+    with pytest.raises(ValidationError, match="more than one expense with id 1"):
+        Ledger(
+            group=Group(name="Flat"), expenses=[ledger_expense(1), ledger_expense(1)]
+        )
+
+
+def test_ledger_rejects_duplicate_payment_ids() -> None:
+    with pytest.raises(ValidationError, match="more than one payment with id 7"):
+        Ledger(
+            group=Group(name="Flat"), payments=[ledger_payment(7), ledger_payment(7)]
+        )
+
+
+def test_ledger_allows_several_unsaved_objects() -> None:
+    ledger = Ledger(
+        group=Group(name="Flat"), expenses=[ledger_expense(None), ledger_expense(None)]
+    )
+
+    assert len(ledger.expenses) == 2

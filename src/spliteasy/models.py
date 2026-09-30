@@ -29,7 +29,12 @@ from decimal import Decimal
 from enum import Enum
 from typing import TypeVar
 
-from spliteasy.exceptions import DuplicateError, MemberNotFoundError, ValidationError
+from spliteasy.exceptions import (
+    DuplicateError,
+    ExpenseNotFoundError,
+    MemberNotFoundError,
+    ValidationError,
+)
 from spliteasy.money import normalize_currency, parse_decimal, to_money
 
 MAX_NAME_LENGTH = 50
@@ -668,9 +673,11 @@ class Expense:
         ]
         _check_unique_names(self.participants, context="participants")
         self.split_values = self._normalize_split_values()
-        self.items = _check_instances(self.items, LineItem, "items")
-        self.adjustments = _check_instances(self.adjustments, Adjustment, "adjustments")
-        self.shares = _check_instances(self.shares, Share, "shares")
+        self.items = _check_instances(self.items, LineItem, "Expense items")
+        self.adjustments = _check_instances(
+            self.adjustments, Adjustment, "Expense adjustments"
+        )
+        self.shares = _check_instances(self.shares, Share, "Expense shares")
         _check_unique_names((share.member for share in self.shares), context="shares")
 
         category = _normalize_category(self.category)
@@ -923,6 +930,127 @@ class Transfer:
         return payment if date is None else replace(payment, date=date)
 
 
+@dataclass(slots=True, kw_only=True)
+class Ledger:
+    """One group together with all of its expenses and payments.
+
+    A ledger is the unit of loading and saving: the storage layer reads and
+    writes a whole ledger at a time, and the service layer loads a ledger,
+    changes it and saves it again. Keeping a group's data together means
+    balances can always be computed from a single consistent object.
+
+    Expense and payment ids are numbered per group, starting at 1 (see
+    :meth:`next_expense_id` and :meth:`next_payment_id`). Objects that have
+    not been given an id yet have ``id`` set to ``None``.
+
+    Attributes:
+        group: The group.
+        expenses: The group's expenses, in the order they were added.
+        payments: The payments recorded between the group's members.
+    """
+
+    group: Group
+    expenses: list[Expense] = field(default_factory=list)
+    payments: list[Payment] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Validates the fields and copies the lists.
+
+        Raises:
+            ValidationError: If ``group`` is not a :class:`Group`, a list
+                contains an object of the wrong type, or two expenses or two
+                payments have the same id.
+        """
+        if not isinstance(self.group, Group):
+            raise ValidationError(f"Ledger group must be a Group, got {self.group!r}")
+        self.expenses = _check_instances(self.expenses, Expense, "Ledger expenses")
+        self.payments = _check_instances(self.payments, Payment, "Ledger payments")
+        _check_unique_ids(self.expenses, "expense")
+        _check_unique_ids(self.payments, "payment")
+
+    def next_expense_id(self) -> int:
+        """Returns the id for the next new expense in this group.
+
+        Returns:
+            One more than the largest existing expense id, or 1 if no expense
+            has an id yet.
+        """
+        return _next_id(self.expenses)
+
+    def next_payment_id(self) -> int:
+        """Returns the id for the next new payment in this group.
+
+        Returns:
+            One more than the largest existing payment id, or 1 if no payment
+            has an id yet.
+        """
+        return _next_id(self.payments)
+
+    def get_expense(self, expense_id: int) -> Expense:
+        """Returns the expense with the given id.
+
+        Args:
+            expense_id: The id of the expense within this group.
+
+        Returns:
+            The stored expense.
+
+        Raises:
+            ExpenseNotFoundError: If the ledger has no expense with this id.
+        """
+        for expense in self.expenses:
+            if expense.id == expense_id:
+                return expense
+        raise ExpenseNotFoundError(expense_id)
+
+    def remove_expense(self, expense_id: int) -> None:
+        """Removes the expense with the given id.
+
+        Args:
+            expense_id: The id of the expense within this group.
+
+        Raises:
+            ExpenseNotFoundError: If the ledger has no expense with this id.
+        """
+        expense = self.get_expense(expense_id)
+        self.expenses = [other for other in self.expenses if other is not expense]
+
+
+def _next_id(entities: Iterable[Expense | Payment]) -> int:
+    """Returns one more than the largest id among entities, starting at 1.
+
+    Args:
+        entities: Expenses or payments, some of which may have no id.
+
+    Returns:
+        The next free id.
+    """
+    return (
+        max((entity.id for entity in entities if entity.id is not None), default=0) + 1
+    )
+
+
+def _check_unique_ids(entities: Iterable[Expense | Payment], what: str) -> None:
+    """Checks that no two entities share an id.
+
+    Args:
+        entities: Expenses or payments. Entities without an id are ignored.
+        what: The kind of entity, used in error messages.
+
+    Raises:
+        ValidationError: If an id appears more than once.
+    """
+    seen: set[int] = set()
+    for entity in entities:
+        if entity.id is None:
+            continue
+        if entity.id in seen:
+            raise ValidationError(
+                f"Ledger has more than one {what} with id {entity.id}"
+            )
+        seen.add(entity.id)
+
+
 def _check_different_members(first: str, second: str, what: str) -> None:
     """Checks that two member names refer to different members.
 
@@ -980,7 +1108,8 @@ def _check_instances(values: Iterable[object], cls: type[T], what: str) -> list[
     Args:
         values: The values to check.
         cls: The class every value must be an instance of.
-        what: The name of the field, used in error messages.
+        what: The field, used at the start of error messages, for example
+            ``"Expense items"``.
 
     Returns:
         A new list with the same values.
@@ -992,7 +1121,7 @@ def _check_instances(values: Iterable[object], cls: type[T], what: str) -> list[
     for value in values:
         if not isinstance(value, cls):
             raise ValidationError(
-                f"Expense {what} must be {cls.__name__} objects, got {value!r}"
+                f"{what} must be {cls.__name__} objects, got {value!r}"
             )
         checked.append(value)
     return checked
